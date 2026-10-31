@@ -1,8 +1,13 @@
-bin/
-dist/
+# Build output
+/bin/
+/dist/
+
+# Local runtime state (anchor to repo root: a bare "identity" also matches
+# internal/identity/ and silently drops the package)
 *.log
-state.json
-state.json.tmp
-relay_hostkey
-identity
-known_hosts
+/state.json
+/state.json.tmp
+/relay_hostkey
+/identity
+/known_hosts
+/control.sock
