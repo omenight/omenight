@@ -1,18 +1,16 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
-	"strconv"
 	"text/tabwriter"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"omenight/internal/admin"
 	"omenight/internal/relay"
 	"omenight/internal/store"
 	"omenight/internal/tui"
@@ -69,9 +67,12 @@ func serve(args []string) {
 	state := fs.String("state", defState, "state file")
 	hostkey := fs.String("hostkey", defHostKey, "host key path")
 	socket := fs.String("socket", defSocket, "unix socket for the TUI ('' to disable)")
+	base := fs.Int("port-base", admin.DefaultPortBase, "first port to allocate")
 	fs.Parse(args)
 
-	r, err := relay.New(relay.Config{Addr: *addr, State: *state, HostKey: *hostkey, Socket: *socket})
+	r, err := relay.New(relay.Config{
+		Addr: *addr, State: *state, HostKey: *hostkey, Socket: *socket, PortBase: *base,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -116,14 +117,11 @@ func clients(args []string) {
 	w.Flush()
 }
 
-// approve activates a client and, if it has no listen address yet, gives it
-// the lowest free port from the relay's allocation range. The port is
-// persisted, so it survives reconnects and restarts.
 func approve(args []string) {
 	fs := flag.NewFlagSet("approve", flag.ExitOnError)
 	state := fs.String("state", defState, "state file")
 	name := fs.String("name", "", "client name")
-	base := fs.Int("port-base", defPortBase, "first port to allocate")
+	base := fs.Int("port-base", admin.DefaultPortBase, "first port to allocate")
 	fs.Parse(args)
 	if *name == "" {
 		log.Fatal("-name is required")
@@ -133,50 +131,11 @@ func approve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	c, ok := st.ByName(*name)
-	if !ok {
-		log.Fatalf("%s: no such client (has it connected yet?)", *name)
-	}
-	if len(c.Allow) == 0 {
-		addr, err := allocate(st, *base)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if c, err = st.Allow(*name, addr); err != nil {
-			log.Fatal(err)
-		}
-	}
-	if c, err = st.SetStatus(*name, store.StatusActive); err != nil {
+	c, err := admin.New(st, *base).Approve(*name)
+	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("%s approved, may bind %v\n", c.Name, c.Allow)
-}
-
-// allocate finds a port nobody else is using and that can actually be bound.
-func allocate(st *store.Store, base int) (string, error) {
-	used := map[int]bool{}
-	for _, c := range st.All() {
-		for _, a := range c.Allow {
-			if host, port, err := net.SplitHostPort(a); err == nil && host == "127.0.0.1" {
-				if n, err := strconv.Atoi(port); err == nil {
-					used[n] = true
-				}
-			}
-		}
-	}
-	for i := 0; i < 64; i++ {
-		p := store.NextFreePort(base, 1000, used)
-		if p == 0 {
-			return "", errors.New("no free port left in the allocation range")
-		}
-		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
-		if err == nil {
-			ln.Close()
-			return fmt.Sprintf("127.0.0.1:%d", p), nil
-		}
-		used[p] = true
-	}
-	return "", errors.New("no free port left in the allocation range")
 }
 
 func setStatus(args []string, status string) {
@@ -211,7 +170,7 @@ func allow(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	c, err := st.Allow(*name, *addr)
+	c, err := admin.New(st, admin.DefaultPortBase).Allow(*name, *addr)
 	if err != nil {
 		log.Fatalf("%s: %v", *name, err)
 	}

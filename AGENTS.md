@@ -65,6 +65,13 @@ Start background processes with `setsid cmd </dev/null >log 2>&1 &`. Plain
 - Liveness couples both sides: the agent pings the control channel every
   `HeartbeatSec` (15), the relay watchdog drops at 2× that and unbinds the
   ports. Changing one interval without the other breaks detection.
+- The daemon's socket serves snapshots and also accepts one JSON command
+  (`approve`/`revoke`/`allow`). Commands mutate through `internal/admin` and
+  then call `revalidateAll()` explicitly: `watch()` compares file mtimes, so it
+  cannot notice a write this process just made. Forget that and a TUI approval
+  does nothing until the session is dropped by something else.
+- `internal/admin` owns port allocation and status changes. The CLI and the
+  socket both call it; do not reimplement approve in a new frontend.
 - `approve` does two things: sets the status and, if the client has no allow
   entry yet, allocates the lowest free port from 20000 up and writes it into
   the allow list. The port is therefore persisted per client and stable across

@@ -60,3 +60,47 @@ func TestHuman(t *testing.T) {
 		}
 	}
 }
+
+func TestSelection(t *testing.T) {
+	m := Model{}
+	m.snap = &api.Snapshot{Clients: []api.Client{{Name: "a"}, {Name: "b"}}}
+
+	if got := m.selected(); got != "a" {
+		t.Fatalf("want a, got %q", got)
+	}
+	m.cursor = 1
+	if got := m.selected(); got != "b" {
+		t.Fatalf("want b, got %q", got)
+	}
+	m.cursor = 9
+	m.clamp()
+	if m.cursor != 1 {
+		t.Fatalf("cursor not clamped: %d", m.cursor)
+	}
+	m.snap.Clients = nil
+	m.clamp()
+	if m.cursor != 0 || m.selected() != "" {
+		t.Fatalf("empty list should reset the cursor")
+	}
+}
+
+func TestViewMarksCursor(t *testing.T) {
+	m := Model{}
+	m.snap = &api.Snapshot{
+		Listen:  "0.0.0.0:2223",
+		Clients: []api.Client{{Name: "node-a", Status: "active"}, {Name: "node-b", Status: "pending"}},
+	}
+	out := m.View()
+
+	if !strings.Contains(out, "› node-a") {
+		t.Fatalf("cursor marker missing from first row:\n%s", out)
+	}
+	if strings.Contains(out, "› node-b") {
+		t.Fatalf("cursor marker on the wrong row:\n%s", out)
+	}
+	for _, want := range []string{"a approve", "x revoke", "j/k move"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("footer missing %q", want)
+		}
+	}
+}

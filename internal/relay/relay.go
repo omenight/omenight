@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"omenight/internal/admin"
 	"omenight/internal/api"
 	"omenight/internal/identity"
 	"omenight/internal/proto"
@@ -25,16 +26,18 @@ import (
 const defaultHeartbeat = 15 // seconds
 
 type Config struct {
-	Addr    string
-	HostKey string
-	State   string
-	Socket  string
+	Addr     string
+	HostKey  string
+	State    string
+	Socket   string
+	PortBase int
 }
 
 type Relay struct {
 	cfg     Config
 	signer  ssh.Signer
 	store   *store.Store
+	admin   *admin.Admin
 	started time.Time
 
 	mu       sync.Mutex
@@ -54,6 +57,7 @@ func New(cfg Config) (*Relay, error) {
 		cfg:      cfg,
 		signer:   signer,
 		store:    st,
+		admin:    admin.New(st, cfg.PortBase),
 		started:  time.Now(),
 		sessions: map[string]*session{},
 	}, nil
@@ -123,9 +127,16 @@ func (r *Relay) watch() {
 		if !changed {
 			continue
 		}
-		for _, s := range r.snapshot() {
-			s.revalidate()
-		}
+		r.revalidateAll()
+	}
+}
+
+// revalidateAll applies policy changes to live sessions. Called both after an
+// external store edit and after a command served by this daemon (which the
+// file watcher cannot see, because the daemon updated the mtime itself).
+func (r *Relay) revalidateAll() {
+	for _, s := range r.snapshot() {
+		s.revalidate()
 	}
 }
 
@@ -251,7 +262,8 @@ func (r *Relay) serveSocket(path string) {
 		go func(c net.Conn) {
 			defer c.Close()
 
-			// Serve both a bare JSON client and `curl --unix-socket`.
+			// Three clients share this socket: a bare snapshot reader, a
+			// command sender, and `curl --unix-socket` for debugging.
 			br := bufio.NewReader(c)
 			c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 			line, _ := br.ReadString('\n')
@@ -260,6 +272,15 @@ func (r *Relay) serveSocket(path string) {
 
 			if strings.HasPrefix(line, "GET ") {
 				fmt.Fprint(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+				json.NewEncoder(c).Encode(r.Snapshot())
+				return
+			}
+			if strings.HasPrefix(strings.TrimSpace(line), "{") {
+				var cmd api.Command
+				if err := json.Unmarshal([]byte(line), &cmd); err == nil && cmd.Cmd != "" {
+					json.NewEncoder(c).Encode(r.runCommand(cmd))
+					return
+				}
 			}
 			if err := json.NewEncoder(c).Encode(r.Snapshot()); err != nil {
 				return
@@ -267,6 +288,43 @@ func (r *Relay) serveSocket(path string) {
 		}(c)
 	}
 }
+
+// runCommand is the write half of the socket. It mutates the store through
+// the same admin code the CLI uses, then pushes the change into live sessions.
+func (r *Relay) runCommand(cmd api.Command) api.Response {
+	var (
+		cl  store.Client
+		err error
+		msg string
+	)
+	switch cmd.Cmd {
+	case "approve":
+		if cl, err = r.admin.Approve(cmd.Name); err == nil {
+			msg = fmt.Sprintf("%s approved, may bind %v", cl.Name, cl.Allow)
+		}
+	case "revoke":
+		if cl, err = r.admin.Revoke(cmd.Name); err == nil {
+			msg = fmt.Sprintf("%s revoked", cl.Name)
+		}
+	case "allow":
+		if cl, err = r.admin.Allow(cmd.Name, cmd.Addr); err == nil {
+			msg = fmt.Sprintf("%s may bind %v", cl.Name, cl.Allow)
+		}
+	default:
+		err = fmt.Errorf("unknown command %q", cmd.Cmd)
+	}
+
+	if err != nil {
+		log.Printf("command %s %s: %v", cmd.Cmd, cmd.Name, err)
+		return api.Response{OK: false, Message: err.Error(), Snapshot: ptr(r.Snapshot())}
+	}
+
+	log.Printf("%s", msg)
+	r.revalidateAll()
+	return api.Response{OK: true, Message: msg, Snapshot: ptr(r.Snapshot())}
+}
+
+func ptr(s api.Snapshot) *api.Snapshot { return &s }
 
 func dirOf(p string) string {
 	for i := len(p) - 1; i >= 0; i-- {

@@ -84,10 +84,14 @@ reconnects and renegotiates.
 omenight-relay tui
 ```
 
-Reads a snapshot per second over the daemon's unix socket
-(`/run/omenight/control.sock`): name, status, online, live connections, bytes
-each way, allowlist, last seen. `r` refreshes, `q` quits. The socket also
-answers `curl --unix-socket /run/omenight/control.sock http://x/` with JSON.
+Live view over the daemon's unix socket: name, status, online, connections,
+bytes each way, assigned port, last seen. `j`/`k` move, `a` approves the
+selected node (which also assigns its port), `x` revokes it, `r` refreshes,
+`q` quits. Actions are sent to the running daemon, so they apply immediately —
+a revoke unbinds the port and drops the session while you watch.
+
+The socket also answers `curl --unix-socket /run/omenight/control.sock http://x/`
+with JSON.
 
 ## Measured
 
