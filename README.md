@@ -29,26 +29,31 @@ service.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/omenight/omenight/main/install.sh \
-  | sudo sh -s -- \
-      --relay relay.example.com:2223 \
-      --name node-a \
-      --socks 127.0.0.1:1080 \
-      --forward 127.0.0.1:1085=127.0.0.1:1080
+  | sudo sh -s -- --relay relay.example.com:2223 --egress 1085
 ```
+
+That is the whole install for an exit node: SOCKS5 on `127.0.0.1:1080` on the
+node, forwarded to `127.0.0.1:1085` on the relay. The client name defaults to
+the machine's hostname; pass `--name` to override. No curl on the box? Use
+`wget -qO- <url> | sudo sh -s -- ...`.
 
 It prints the node's public key. Approve it on the relay:
 
 ```sh
-omenight-relay approve -name node-a
-omenight-relay allow   -name node-a -addr 127.0.0.1:1085
+omenight-relay approve -name box
+omenight-relay allow   -name box -addr 127.0.0.1:1085
 ```
 
-Then, from the relay: `curl --socks5hostname 127.0.0.1:1085 https://ifconfig.me/ip`
-(`socks5h` so DNS resolves on the node).
+Then, from the relay:
+`curl --socks5-hostname 127.0.0.1:1085 https://ifconfig.me/ip` (`socks5h` so
+DNS resolves on the node).
+
+For anything other than an egress node, be explicit: `--socks
+127.0.0.1:1080 --forward 127.0.0.1:1085=127.0.0.1:1080` (repeatable).
 
 Re-running the installer upgrades the binary and keeps the identity. `--from
-./omenight-agent` installs a local build, `--uninstall` removes the service,
-`--purge` also removes `/etc/omenight`.
+./omenight-agent` installs a local build, `--no-start` just writes the unit,
+`--uninstall` removes the service, `--purge` also removes `/etc/omenight`.
 
 ## Run the relay
 

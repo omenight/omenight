@@ -22,6 +22,7 @@ SOCKS=""
 VERSION=""
 FROM=""
 FORWARDS=""
+EGRESS=""
 UNINSTALL=0
 PURGE=0
 START=1
@@ -35,8 +36,9 @@ usage() {
 omenight agent installer
 
   --relay HOST:PORT       relay address (required)
-  --name NAME             client name, the SSH username (required)
+  --name NAME             client name, the SSH username (default: hostname)
   --forward L=T           forward relay L to local T (repeatable)
+  --egress PORT           shorthand: SOCKS on 127.0.0.1:1080, forward PORT to it
   --socks ADDR            run the built-in SOCKS5 server, e.g. 127.0.0.1:1080
   --version TAG           install a specific release (default: latest)
   --from PATH             install a local binary instead of downloading
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
 	--relay) RELAY="${2:?}"; shift 2 ;;
 	--name) NAME="${2:?}"; shift 2 ;;
 	--forward) FORWARDS="$FORWARDS $2"; shift 2 ;;
+	--egress) EGRESS="${2:?}"; shift 2 ;;
 	--socks) SOCKS="${2:?}"; shift 2 ;;
 	--version) VERSION="${2:?}"; shift 2 ;;
 	--from) FROM="${2:?}"; shift 2 ;;
@@ -144,17 +147,25 @@ do_uninstall() {
 
 [ "$UNINSTALL" = 1 ] && do_uninstall
 
+# --egress is the common case: an exit node serving SOCKS.
+if [ -n "$EGRESS" ]; then
+	[ -n "$SOCKS" ] || SOCKS="127.0.0.1:1080"
+	FORWARDS="$FORWARDS 127.0.0.1:$EGRESS=$SOCKS"
+fi
+
 # Interactive fallback when values are missing.
 if [ -z "$RELAY" ] && [ -t 0 ]; then
 	printf 'relay address (host:port): '
 	read -r RELAY
 fi
-if [ -z "$NAME" ] && [ -t 0 ]; then
-	printf 'client name: '
-	read -r NAME
-fi
 [ -n "$RELAY" ] || die "--relay is required"
-[ -n "$NAME" ] || die "--name is required"
+
+# Default the label to the machine's own name, so a fresh box needs one flag.
+if [ -z "$NAME" ]; then
+	NAME="$(hostname -s 2>/dev/null || hostname)"
+fi
+NAME="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-')"
+[ -n "$NAME" ] || die "could not determine a name, pass --name"
 
 case "$RELAY$NAME$SOCKS$FORWARDS" in
 *'"'* | *\\*) die "quotes and backslashes are not allowed in values" ;;
