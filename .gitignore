@@ -1,0 +1,8 @@
+bin/
+dist/
+*.log
+state.json
+state.json.tmp
+relay_hostkey
+identity
+known_hosts

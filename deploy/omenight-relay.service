@@ -1,0 +1,18 @@
+[Unit]
+Description=Omenight relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=omenight
+Group=omenight
+StateDirectory=omenight
+ExecStart=/usr/local/bin/omenight-relay serve \
+	-addr 0.0.0.0:2223 \
+	-state /var/lib/omenight/state.json \
+	-hostkey /var/lib/omenight/hostkey
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

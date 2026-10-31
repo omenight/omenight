@@ -1,0 +1,4 @@
+# /etc/conf.d/omenight-agent
+#
+# The name must match what you approve on the relay.
+OMENIGHT_OPTS="-relay relay.example.com:2223 -name pi-sochi -socks 127.0.0.1:1080 -forward 127.0.0.1:1085=127.0.0.1:1080"
