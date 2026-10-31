@@ -6,35 +6,37 @@ import (
 	"time"
 )
 
-// Snapshot is what the daemon serves on its unix socket: one JSON document
+// Snapshot is what the daemon serves on its unix socket, one JSON document
 // per connection, then close.
 type Snapshot struct {
-	Listen    string    `json:"listen"`
+	Endpoint  string    `json:"endpoint"`
+	Kind      string    `json:"kind"`
 	Version   string    `json:"version"`
-	HostKey   string    `json:"host_key"`
+	PublicKey string    `json:"public_key"`
 	StartedAt time.Time `json:"started_at"`
+	SyncError string    `json:"sync_error,omitempty"`
 	Clients   []Client  `json:"clients"`
 }
 
 type Client struct {
-	Name     string    `json:"name"`
-	Status   string    `json:"status"`
-	Online   bool      `json:"online"`
-	Remote   string    `json:"remote,omitempty"`
-	Since    time.Time `json:"since,omitempty"`
-	Conns    int64     `json:"conns"`
-	Up       int64     `json:"up"`
-	Down     int64     `json:"down"`
-	Allow    []string  `json:"allow,omitempty"`
-	LastSeen time.Time `json:"last_seen,omitempty"`
+	Name      string    `json:"name"`
+	Status    string    `json:"status"`
+	Online    bool      `json:"online"`
+	Iface     string    `json:"iface"`
+	Port      int       `json:"port"`
+	Mark      int       `json:"mark"`
+	Address   string    `json:"address"` // node end of the tunnel
+	Endpoint  string    `json:"endpoint,omitempty"`
+	Handshake time.Time `json:"handshake,omitempty"`
+	Rx        int64     `json:"rx"`
+	Tx        int64     `json:"tx"`
 }
 
 // Command is a write request. Sending one instead of connecting idle turns
 // the snapshot socket into a control socket.
 type Command struct {
-	Cmd  string `json:"cmd"` // approve | revoke | allow
+	Cmd  string `json:"cmd"` // approve | revoke
 	Name string `json:"name"`
-	Addr string `json:"addr,omitempty"`
 }
 
 type Response struct {

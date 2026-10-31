@@ -1,8 +1,8 @@
 # AGENTS.md
 
-omenight: reverse TCP tunnels over SSH. A node agent dials out to a relay; the
-relay is an SSH server with a control plane. Two binaries from one Go module
-named `omenight` (no domain in the module path).
+omenight: AmneziaWG exit nodes behind one relay. One Go binary,
+`omenight-relay`, plus `install.sh`, which runs on the nodes. Module name
+`omenight` (no domain in the module path).
 
 ## Commands
 
@@ -10,88 +10,76 @@ named `omenight` (no domain in the module path).
 gofmt -w .            # CI rejects any unformatted file
 go vet ./...
 go test ./...
-go test ./internal/store -run TestEnrollmentFlow   # single test
-
-make agent            # bin/omenight-agent
+go test ./internal/wg -run TestSync   # single test
 make relay            # bin/omenight-relay
-make dist             # arm64 agent + amd64 relay into dist/
+make e2e              # real kernel in user namespaces, needs wg, wg-quick, nft, python3
 ```
 
-Always build with `CGO_ENABLED=0`: the node runs Alpine/musl and the binary
-must be static.
+Always build with `CGO_ENABLED=0`, the relay binary must be static.
 
-Pushing a `v*` tag builds and publishes release assets; `install.sh` always
-downloads from `releases/latest`. A change to the agent is not shipped until a
-tag is pushed.
+## How it fits together
 
-## Verifying the tunnel path
+- `init` fixes the settings (endpoint, net, port/mark base, iface prefix,
+  relay key, AWG params). Node N gets interface `om<N>`, UDP `51820+N`, the
+  N-th /30 of the net (relay `.1`, node `.2`) and fwmark = routing table
+  `7700+N`. Everything derives from the slot, so settings never change after
+  `init`. `Store.Init` refuses a second run.
+- `add` generates the node's key pair on the relay and prints a paste block,
+  `sh <<'OMENIGHT'`, the node's awg-quick conf in `OMENIGHT_CONF`, then
+  `install.sh` from `go:embed` with comments and blank lines stripped. The
+  installer version is pinned to the relay binary, nothing is downloaded.
+- The daemon (`serve`) only reconciles. `wg.Manager.Sync` shells out to `ip`,
+  `awg`/`wg` and `sysctl` and is idempotent. It runs when the state file's
+  mtime changes (2s poll), after a socket command, and every 30s to heal drift.
+- The state file is the only source of truth. CLI commands write it directly,
+  the daemon picks it up. Socket commands call `sync()` themselves, because
+  the mtime watch cannot see the daemon's own writes.
+- Online status comes from the kernel's latest handshake (under 3 min), not
+  from the store. Nothing liveness-related is persisted.
 
-There is no integration test. Exercise it by hand:
+## Facts that are not visible in the code
 
-```sh
-./bin/omenight-relay serve -addr 127.0.0.1:2222 -state /tmp/s.json \
-  -hostkey /tmp/hk -socket /tmp/c.sock
-./bin/omenight-agent run -relay 127.0.0.1:2222 -name node -egress \
-  -key /tmp/id -known-hosts /tmp/kh
-./bin/omenight-relay approve -state /tmp/s.json -name node   # prints the port
-curl --socks5-hostname 127.0.0.1:20000 https://ifconfig.me/ip
-```
-
-The first connect is `pending` and binds nothing; that is the enrollment path,
-not a failure. Suffix `socks5h`/`--socks5-hostname` matters: DNS must resolve on
-the node.
-
-Start background processes with `setsid cmd </dev/null >log 2>&1 &`. Plain
-`nohup` gets killed with the parent shell in this environment.
-
-## Architecture facts that are not visible in filenames
-
-- The data plane is stock SSH. The relay implements `tcpip-forward` and
-  `forwarded-tcpip` by hand because `x/crypto/ssh` has no server-side `Listen`.
-  Do not invent a custom channel type; the agent never needs `ssh.Client.Listen`.
-- Grants are negotiated per session, and the allowlist is the policy. In
-  `hello` the agent either names exact listen addresses or sends none, which
-  means "everything I am allowed" — that is egress mode, where the relay owns
-  the port number. `handleForward` then checks requests against those session
-  grants, not the store, so editing the allowlist mid-session does nothing
-  until the session is dropped and renegotiated.
-- The relay never learns destinations. Targets live in the agent's config and
-  the SOCKS5 server runs on the node; anything that makes the relay dial a
-  destination is a design change.
-- The store is a JSON file held in memory with atomic saves. `watch()` reloads
-  it every 2s and drops sessions whose status or allow list changed, so CLI
-  approve/revoke applies live by forcing a reconnect. Do not add a
-  "restart to apply" path.
-- Liveness couples both sides: the agent pings the control channel every
-  `HeartbeatSec` (15), the relay watchdog drops at 2× that and unbinds the
-  ports. Changing one interval without the other breaks detection.
-- The daemon's socket serves snapshots and also accepts one JSON command
-  (`approve`/`revoke`/`allow`). Commands mutate through `internal/admin` and
-  then call `revalidateAll()` explicitly: `watch()` compares file mtimes, so it
-  cannot notice a write this process just made. Forget that and a TUI approval
-  does nothing until the session is dropped by something else.
-- `internal/admin` owns port allocation and status changes. The CLI and the
-  socket both call it; do not reimplement approve in a new frontend.
-- `approve` does two things: sets the status and, if the client has no allow
-  entry yet, allocates the lowest free port from 20000 up and writes it into
-  the allow list. The port is therefore persisted per client and stable across
-  reconnects; it is never reassigned while the client exists.
-- The agent merges a JSON config file with flags; flags win, tracked via
-  `fs.Visit`. The installer writes that file so every init system shares one
-  source of truth.
+- OpenWrt busybox has no `base64`. That is why the paste block is plain text.
+  Do not "optimize" it into a gzip/base64 blob.
+- `install.sh` is wrapped in `main "$@" </dev/null` on purpose. It is read
+  from stdin when pasted, so `sh` must parse the whole script before any
+  command runs, or a child reading stdin would eat the rest of the script.
+- The paste delimiter `OMENIGHT` must never be a line of `install.sh`, and
+  lines starting with `#` vanish in the paste, so no heredoc in the installer
+  may rely on them. `TestPaste` checks the delimiter.
+- A WireGuard interface picks the peer by destination, so two exit nodes
+  cannot share one interface with `0.0.0.0/0`. Hence one interface per node.
+- Revoked nodes keep their interface and routes without a peer.
+  Marked traffic is then dropped, not routed out of the relay's own IP. Same
+  reason for the `unreachable default` IPv6 route in every node table.
+- rp_filter is set to 2 per interface. Replies arrive on `omN` from sources
+  the main table routes elsewhere, and the kernel uses max(all, iface). Loose
+  mode still needs the source routable via the main table, so the relay host
+  must have a default route (every VPS does, the e2e test fakes one).
+- Revoke removes the peer, so the relay forgets the node's endpoint. After
+  approve, traffic flows again only with the node's next keepalive (25s).
+- Ip rules owned by the relay all sit at priority `wg.RulePref` (7700). Sync
+  deletes any rule at that priority it does not want, and touches no other.
+  Interfaces are ours only if named prefix + digits.
+- After a reboot, until the daemon starts, there are no rules, so marked
+  traffic leaves from the relay itself. Start the relay before Xray if that
+  matters.
+- The node conf has `Table = off` and `AllowedIPs = <relay>/32`. The node's
+  own traffic never enters the tunnel. The node masquerades out its WAN and
+  blocks private ranges from the tunnel. On OpenWrt that is a fw4 zone with
+  forwarding only to `wan` (the `wan` zone's masq does the NAT). pbr with
+  `lan_device br-lan` does not touch tunnel traffic.
+- AWG params are the 1.0 set (jc, jmin, jmax, s1, s2, h1-h4). Every AWG
+  version understands it, newer ones add s3/s4/i1-i5 on top.
+- The private key goes to `awg set` through stdin (`private-key /dev/stdin`)
+  so it never shows in `ps`. `TestSync` enforces that.
 
 ## Traps
 
-- Release asset names are a contract: `install.sh` builds
-  `$SVC-linux-$ARCH` = `omenight-agent-linux-<amd64|arm64|armv6|armv7>`.
-  `Makefile:dist` and `release.yml` must match or installs 404 silently.
-- `install.sh` defaults to an egress node (`"egress": true`); `--socks` and
-  `--forward` switch it to manual mode. It runs under POSIX sh on Alpine: no
-  bashisms, no curl assumption (wget fallback), busybox `adduser` differs from
-  `useradd`. Test it with `--from ./binary --no-start`.
-- Anchoring `.gitignore` patterns is not cosmetic. A bare `identity` pattern
-  ignored `internal/identity/` and broke a release. Use `/identity`.
-- The relay binary carries the TUI (bubbletea). Keep TUI dependencies out of the
-  agent — that is the binary shipped to small boxes.
-- TCP only. SSH has no datagrams, so UDP and QUIC are out of scope, not missing
-  features to add.
+- `install.sh` runs under busybox ash. No bashisms, no `grep -A`, no
+  `base64`. Test changes there (`ssh <router> sh < script`) with `uci`,
+  `ifup` and the firewall reload stubbed out.
+- Anchoring `.gitignore` patterns is not cosmetic. A bare pattern can match a
+  package directory under `internal/` and silently drop it from a release.
+- TUI dependencies (bubbletea) are fine in the relay. There is no node binary
+  any more, the node side is only `install.sh`.

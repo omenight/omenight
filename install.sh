@@ -1,316 +1,280 @@
 #!/bin/sh
-# omenight agent installer.
-#
-#   curl -fsSL https://raw.githubusercontent.com/omenight/omenight/main/install.sh \
-#     | sh -s -- --relay relay.example.com:2223 --name node-a
-#
-# Runs on any distro with a POSIX shell. Detects architecture and init
-# system, installs one static binary, writes a config, and prints the public
-# key to approve on the relay. Safe to re-run: the identity is preserved.
+# omenight node installer, normally pasted inside the block from `omenight-relay add`.
+# Standalone use is `sh install.sh --conf node.conf` or `sh install.sh --uninstall`.
 
-set -eu
-
-REPO="${OMENIGHT_REPO:-omenight/omenight}"
-PREFIX="${OMENIGHT_PREFIX:-/usr/local}"
-CONF_DIR="${OMENIGHT_CONF:-/etc/omenight}"
-SVC="omenight-agent"
-BIN="$PREFIX/bin/$SVC"
-
-RELAY=""
-NAME=""
-SOCKS=""
-VERSION=""
-FROM=""
-FORWARDS=""
-UNINSTALL=0
-PURGE=0
-START=1
+IFACE=omenight
+CONF_DIR=/etc/omenight
 
 say() { printf '%s\n' "$*"; }
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+die() {
+	printf 'omenight %s\n' "$*" >&2
+	exit 1
+}
 have() { command -v "$1" >/dev/null 2>&1; }
 
-usage() {
-	cat <<EOF
-omenight agent installer
+conf_get() {
+	printf '%s\n' "$CONF" | sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" | head -n 1
+}
 
-  --relay HOST:PORT       relay address (required)
-  --name NAME             client name, the SSH username (default: hostname)
-  --forward L=T           manual mode: forward relay L to local T (repeatable)
-  --socks ADDR            manual mode: run SOCKS5 on this fixed address
-  --version TAG           install a specific release (default: latest)
-  --from PATH             install a local binary instead of downloading
-  --no-start              install but do not start the service
-  --uninstall             stop and remove the service and binary
-  --purge                 with --uninstall, also remove $CONF_DIR
+platform() {
+	if [ -f /etc/openwrt_release ] && have uci; then
+		echo openwrt
+	else
+		echo linux
+	fi
+}
 
-Examples:
-  egress node (default):  --relay relay.example.com:2223 --name node-a
-  explicit ports:         --relay ... --name node-a \
-                          --socks 127.0.0.1:1080 --forward 127.0.0.1:1085=127.0.0.1:1080
+load_conf() {
+	CONF=$(printf '%s\n' "$CONF" | tr -d '\r')
+	NAME=$(printf '%s\n' "$CONF" | sed -n 's/^# omenight node //p' | head -n 1)
+	PRIV=$(conf_get PrivateKey)
+	ADDR=$(conf_get Address)
+	PUB=$(conf_get PublicKey)
+	EP=$(conf_get Endpoint)
+	ALLOWED=$(conf_get AllowedIPs)
+	KA=$(conf_get PersistentKeepalive)
+	[ -n "$PRIV" ] && [ -n "$ADDR" ] && [ -n "$PUB" ] && [ -n "$EP" ] && [ -n "$ALLOWED" ] ||
+		die "the config is incomplete, print it again with omenight-relay show"
+	case "$PRIV$ADDR$PUB$EP$ALLOWED$KA" in
+	*[!]A-Za-z0-9+/=.:[-]*) die "unexpected characters in the config" ;;
+	esac
+	RELAY_IP=${ALLOWED%/*}
+	EP_HOST=${EP%:*}
+	EP_PORT=${EP##*:}
+	EP_HOST=${EP_HOST#\[}
+	EP_HOST=${EP_HOST%\]}
+	KIND=wg
+	[ -n "$(conf_get Jc)" ] && KIND=awg
+	if [ "$KIND" = awg ]; then
+		TOOL=awg
+	else
+		TOOL=wg
+	fi
+}
+
+# Packages differ between releases (apk since 25.x, opkg before), so this
+# only tries and leaves the error to the caller.
+openwrt_packages() {
+	if have apk; then
+		apk update >/dev/null 2>&1
+		apk add "$@"
+	elif have opkg; then
+		opkg update >/dev/null 2>&1
+		opkg install "$@"
+	else
+		return 1
+	fi
+}
+
+openwrt_install() {
+	if [ "$KIND" = awg ]; then
+		proto=amneziawg
+		pkgs="kmod-amneziawg amneziawg-tools"
+	else
+		proto=wireguard
+		pkgs="kmod-wireguard wireguard-tools"
+	fi
+	if [ ! -f "/lib/netifd/proto/$proto.sh" ] || ! have "$TOOL"; then
+		say "installing $pkgs"
+		openwrt_packages $pkgs || die "could not install $pkgs, add them by hand and paste again"
+		[ -f "/lib/netifd/proto/$proto.sh" ] || die "$proto netifd support is still missing"
+	fi
+	z=0
+	while zn=$(uci -q get "firewall.@zone[$z].name"); do
+		[ "$zn" = wan ] && break
+		z=$((z + 1))
+	done
+	[ "${zn:-}" = wan ] || die "no firewall zone named wan"
+	[ "$(uci -q get "firewall.@zone[$z].masq")" = 1 ] ||
+		say "warning, the wan zone has no masquerade, tunnel traffic will not get out"
+
+	ifdown "$IFACE" 2>/dev/null || true
+	for s in network.$IFACE network.${IFACE}_relay firewall.$IFACE firewall.${IFACE}_wan \
+		firewall.${IFACE}_ssh firewall.${IFACE}_ping; do
+		uci -q delete "$s" || true
+	done
+
+	{
+		echo "set network.$IFACE=interface"
+		echo "set network.$IFACE.proto='$proto'"
+		echo "set network.$IFACE.private_key='$PRIV'"
+		echo "add_list network.$IFACE.addresses='$ADDR'"
+		if [ "$KIND" = awg ]; then
+			for k in Jc Jmin Jmax S1 S2 H1 H2 H3 H4; do
+				echo "set network.$IFACE.awg_$(echo "$k" | tr 'A-Z' 'a-z')='$(conf_get "$k")'"
+			done
+		fi
+		echo "set network.${IFACE}_relay=${proto}_$IFACE"
+		echo "set network.${IFACE}_relay.description='omenight relay'"
+		echo "set network.${IFACE}_relay.public_key='$PUB'"
+		echo "set network.${IFACE}_relay.endpoint_host='$EP_HOST'"
+		echo "set network.${IFACE}_relay.endpoint_port='$EP_PORT'"
+		echo "set network.${IFACE}_relay.persistent_keepalive='${KA:-25}'"
+		echo "add_list network.${IFACE}_relay.allowed_ips='$ALLOWED'"
+		echo "set network.${IFACE}_relay.route_allowed_ips='0'"
+
+		# Forwarding only to wan, so the relay cannot reach the LAN. Input
+		# stays closed apart from ssh and ping from the relay.
+		echo "set firewall.$IFACE=zone"
+		echo "set firewall.$IFACE.name='$IFACE'"
+		echo "add_list firewall.$IFACE.network='$IFACE'"
+		echo "set firewall.$IFACE.input='REJECT'"
+		echo "set firewall.$IFACE.output='ACCEPT'"
+		echo "set firewall.$IFACE.forward='REJECT'"
+		echo "set firewall.${IFACE}_wan=forwarding"
+		echo "set firewall.${IFACE}_wan.src='$IFACE'"
+		echo "set firewall.${IFACE}_wan.dest='wan'"
+		echo "set firewall.${IFACE}_ssh=rule"
+		echo "set firewall.${IFACE}_ssh.name='omenight-ssh'"
+		echo "set firewall.${IFACE}_ssh.src='$IFACE'"
+		echo "set firewall.${IFACE}_ssh.src_ip='$RELAY_IP'"
+		echo "set firewall.${IFACE}_ssh.proto='tcp'"
+		echo "set firewall.${IFACE}_ssh.dest_port='22'"
+		echo "set firewall.${IFACE}_ssh.target='ACCEPT'"
+		echo "set firewall.${IFACE}_ping=rule"
+		echo "set firewall.${IFACE}_ping.name='omenight-ping'"
+		echo "set firewall.${IFACE}_ping.src='$IFACE'"
+		echo "set firewall.${IFACE}_ping.proto='icmp'"
+		echo "set firewall.${IFACE}_ping.icmp_type='echo-request'"
+		echo "set firewall.${IFACE}_ping.target='ACCEPT'"
+	} | uci batch
+
+	uci commit network
+	uci commit firewall
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	ifup "$IFACE"
+}
+
+openwrt_uninstall() {
+	ifdown "$IFACE" 2>/dev/null || true
+	for s in network.$IFACE network.${IFACE}_relay firewall.$IFACE firewall.${IFACE}_wan \
+		firewall.${IFACE}_ssh firewall.${IFACE}_ping; do
+		uci -q delete "$s" || true
+	done
+	uci commit network
+	uci commit firewall
+	/etc/init.d/firewall reload >/dev/null 2>&1
+}
+
+linux_paths() {
+	if [ "$KIND" = awg ]; then
+		QUICK=awg-quick
+		QUICK_DIR=/etc/amnezia/amneziawg
+	else
+		QUICK=wg-quick
+		QUICK_DIR=/etc/wireguard
+	fi
+}
+
+linux_install() {
+	linux_paths
+	have "$QUICK" || die "$QUICK is missing. Install $([ "$KIND" = awg ] && echo 'AmneziaWG (kernel module or amneziawg-go, plus amneziawg-tools)' || echo wireguard-tools) and paste again"
+	have nft || die "nft is missing, install nftables and paste again"
+	if have iptables && iptables -S FORWARD 2>/dev/null | grep -q '^-P FORWARD DROP'; then
+		say "warning, the iptables FORWARD policy is DROP (docker, ufw), tunnel traffic may not get out"
+	fi
+
+	mkdir -p "$CONF_DIR" "$QUICK_DIR"
+	# Redefining the table on every up keeps re-runs idempotent.
+	cat >"$CONF_DIR/nft.conf" <<EOF
+table inet omenight
+delete table inet omenight
+table inet omenight {
+	chain input {
+		type filter hook input priority -5; policy accept;
+		iifname "$IFACE" ct state established,related accept
+		iifname "$IFACE" ip saddr $RELAY_IP tcp dport 22 accept
+		iifname "$IFACE" icmp type echo-request accept
+		iifname "$IFACE" drop
+	}
+	chain forward {
+		type filter hook forward priority -5; policy accept;
+		iifname "$IFACE" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/3 } drop
+	}
+	chain postrouting {
+		type nat hook postrouting priority 100; policy accept;
+		iifname "$IFACE" oifname != "$IFACE" masquerade
+	}
+}
 EOF
-}
+	printf '%s\n' "$CONF" | awk -v up="sysctl -qw net.ipv4.ip_forward=1; nft -f $CONF_DIR/nft.conf" \
+		-v down="nft delete table inet omenight" \
+		'{ print } /^\[Interface\]/ { print "PostUp = " up; print "PostDown = " down }' \
+		>"$QUICK_DIR/$IFACE.conf"
+	chmod 600 "$QUICK_DIR/$IFACE.conf"
 
-while [ $# -gt 0 ]; do
-	case "$1" in
-	--relay) RELAY="${2:?}"; shift 2 ;;
-	--name) NAME="${2:?}"; shift 2 ;;
-	--forward) FORWARDS="$FORWARDS $2"; shift 2 ;;
-	--socks) SOCKS="${2:?}"; shift 2 ;;
-	--version) VERSION="${2:?}"; shift 2 ;;
-	--from) FROM="${2:?}"; shift 2 ;;
-	--no-start) START=0; shift ;;
-	--uninstall) UNINSTALL=1; shift ;;
-	--purge) PURGE=1; shift ;;
-	-h | --help) usage; exit 0 ;;
-	*) die "unknown option: $1 (try --help)" ;;
-	esac
-done
-
-[ "$(id -u)" = 0 ] || die "run me as root (sudo $0 ...)"
-
-detect_arch() {
-	case "$(uname -m)" in
-	x86_64 | amd64) echo amd64 ;;
-	aarch64 | arm64) echo arm64 ;;
-	armv7l | armv7) echo armv7 ;;
-	armv6l | armv6) echo armv6 ;;
-	*) die "unsupported architecture: $(uname -m)" ;;
-	esac
-}
-
-detect_init() {
-	if [ -d /run/systemd/system ] && have systemctl; then
-		echo systemd
-	elif have rc-service && [ -d /etc/init.d ]; then
-		echo openrc
-	elif have sv && [ -d /etc/sv ]; then
-		echo runit
+	if [ -d /run/systemd/system ]; then
+		systemctl enable "$QUICK@$IFACE" >/dev/null 2>&1
+		systemctl restart "$QUICK@$IFACE" || die "$QUICK@$IFACE failed, see journalctl -u $QUICK@$IFACE"
 	else
-		echo none
+		"$QUICK" down "$IFACE" >/dev/null 2>&1 || true
+		"$QUICK" up "$IFACE" || die "$QUICK up $IFACE failed"
+		say "warning, no systemd, so this does not come back after a reboot. Run '$QUICK up $IFACE' at boot"
 	fi
+	say "note, net.ipv4.ip_forward is now 1 on this host"
 }
 
-fetch_to() {
-	url="$1"
-	out="$2"
-	if have curl; then
-		curl -fsSL "$url" -o "$out"
-	elif have wget; then
-		wget -qO "$out" "$url"
-	else
-		die "need curl or wget"
-	fi
+linux_uninstall() {
+	for q in awg-quick wg-quick; do
+		if [ -d /run/systemd/system ]; then
+			systemctl disable --now "$q@$IFACE" >/dev/null 2>&1 || true
+		fi
+		have "$q" && "$q" down "$IFACE" >/dev/null 2>&1 || true
+	done
+	rm -f "/etc/amnezia/amneziawg/$IFACE.conf" "/etc/wireguard/$IFACE.conf"
+	have nft && nft delete table inet omenight 2>/dev/null || true
 }
 
-ensure_user() {
-	id "$SVC" >/dev/null 2>&1 && return 0
-	if have useradd; then
-		useradd --system --no-create-home --home-dir "$CONF_DIR" \
-			--shell /sbin/nologin "$SVC" 2>/dev/null ||
-			useradd -r -s /sbin/nologin "$SVC"
-	elif have adduser; then
-		adduser -S -H -h "$CONF_DIR" -s /sbin/nologin "$SVC" 2>/dev/null ||
-			adduser --system --no-create-home --shell /sbin/nologin "$SVC"
-	else
-		die "no useradd or adduser"
-	fi
+# The relay shows the node online after the first handshake, so wait for it
+# here and say whether the tunnel actually works.
+wait_handshake() {
+	i=0
+	while [ $i -lt 15 ]; do
+		hs=$("$TOOL" show "$IFACE" latest-handshakes 2>/dev/null | awk '{ print $2 }')
+		if [ -n "$hs" ] && [ "$hs" != 0 ]; then
+			say "handshake with $EP done, the relay sees ${NAME:-this node} online"
+			return 0
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+	say "no handshake with $EP after 15s. Check that UDP $EP_PORT reaches the relay and that the node is still active there"
+	return 1
 }
 
-stop_service() {
-	case "$(detect_init)" in
-	systemd) systemctl disable --now "$SVC" 2>/dev/null || true ;;
-	openrc) rc-service "$SVC" stop 2>/dev/null || true; rc-update del "$SVC" default 2>/dev/null || true ;;
-	runit)
-		rm -f /var/service/"$SVC" /etc/service/"$SVC"
-		sv stop "$SVC" 2>/dev/null || true
-		;;
-	esac
-}
+main() {
+	ACTION=${OMENIGHT_ACTION:-install}
+	CONF=${OMENIGHT_CONF:-}
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--conf)
+			[ -f "${2:-}" ] || die "--conf needs a file"
+			CONF=$(cat "$2")
+			shift 2
+			;;
+		--uninstall)
+			ACTION=uninstall
+			shift
+			;;
+		*) die "unknown option $1" ;;
+		esac
+	done
+	[ "$(id -u)" = 0 ] || die "needs root"
+	set -eu
 
-do_uninstall() {
-	stop_service
-	rm -f "/etc/systemd/system/$SVC.service" "/etc/init.d/$SVC"
-	rm -rf "/etc/sv/$SVC"
-	have systemctl && systemctl daemon-reload 2>/dev/null || true
-	rm -f "$BIN"
-	say "removed $SVC"
-	if [ "$PURGE" = 1 ]; then
+	P=$(platform)
+	if [ "$ACTION" = uninstall ]; then
+		"${P}_uninstall"
 		rm -rf "$CONF_DIR"
-		say "removed $CONF_DIR"
-	else
-		say "kept $CONF_DIR (identity, config) — use --purge to remove"
+		say "omenight removed from this node"
+		return 0
 	fi
-	exit 0
+
+	[ -n "$CONF" ] || die "no config, pass --conf or paste the block from omenight-relay add"
+	load_conf
+	say "setting up ${NAME:-omenight node} ($KIND, $P), tunnel $ADDR to $EP"
+	"${P}_install"
+	wait_handshake || true
 }
 
-[ "$UNINSTALL" = 1 ] && do_uninstall
-
-# Interactive fallback when values are missing.
-if [ -z "$RELAY" ] && [ -t 0 ]; then
-	printf 'relay address (host:port): '
-	read -r RELAY
-fi
-[ -n "$RELAY" ] || die "--relay is required"
-
-# Default the label to the machine's own name, so a fresh box needs one flag.
-if [ -z "$NAME" ]; then
-	NAME="$(hostname -s 2>/dev/null || hostname)"
-fi
-NAME="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-')"
-[ -n "$NAME" ] || die "could not determine a name, pass --name"
-
-case "$RELAY$NAME$SOCKS$FORWARDS" in
-*'"'* | *\\*) die "quotes and backslashes are not allowed in values" ;;
-esac
-
-INIT="$(detect_init)"
-ARCH="$(detect_arch)"
-say "installing $SVC for linux/$ARCH, init: $INIT"
-
-# --- binary -----------------------------------------------------------------
-
-install -d "$PREFIX/bin"
-if [ -n "$FROM" ]; then
-	[ -f "$FROM" ] || die "no such file: $FROM"
-	install -m 0755 "$FROM" "$BIN"
-	say "installed local binary $FROM"
-else
-	if [ -n "$VERSION" ]; then
-		URL="https://github.com/$REPO/releases/download/$VERSION/$SVC-linux-$ARCH"
-	else
-		URL="https://github.com/$REPO/releases/latest/download/$SVC-linux-$ARCH"
-	fi
-	TMP="$(mktemp)"
-	trap 'rm -f "$TMP"' EXIT
-	say "downloading $URL"
-	fetch_to "$URL" "$TMP"
-	install -m 0755 "$TMP" "$BIN"
-fi
-
-# --- config -----------------------------------------------------------------
-
-ensure_user
-install -d -m 0750 "$CONF_DIR"
-chown "$SVC" "$CONF_DIR"
-
-FORWARD_JSON=""
-for f in $FORWARDS; do
-	L="${f%%=*}"
-	T="${f#*=}"
-	[ "$L" != "$f" ] || die "--forward $f: want listen=target"
-	SEP=","
-	[ -z "$FORWARD_JSON" ] && SEP=""
-	FORWARD_JSON="$FORWARD_JSON$SEP
-    {\"listen\": \"$L\", \"target\": \"$T\"}"
-done
-
-# Default is an egress node: the relay assigns the listen port and the agent
-# picks its own loopback SOCKS port, so there is nothing to configure.
-EGRESS_MODE=1
-if [ -n "$SOCKS" ] || [ -n "$FORWARD_JSON" ]; then
-	EGRESS_MODE=0
-fi
-
-{
-	printf '{\n'
-	printf '  "relay": "%s",\n' "$RELAY"
-	printf '  "name": "%s",\n' "$NAME"
-	printf '  "key": "%s/identity",\n' "$CONF_DIR"
-	printf '  "known_hosts": "%s/known_hosts",\n' "$CONF_DIR"
-	if [ "$EGRESS_MODE" = 1 ]; then
-		printf '  "egress": true\n'
-	else
-		[ -n "$SOCKS" ] && printf '  "socks": "%s",\n' "$SOCKS"
-		printf '  "forwards": [%s\n  ]\n' "$FORWARD_JSON"
-	fi
-	printf '}\n'
-} >"$CONF_DIR/agent.json.tmp"
-
-mv "$CONF_DIR/agent.json.tmp" "$CONF_DIR/agent.json"
-chmod 0640 "$CONF_DIR/agent.json"
-
-# Create the identity as root, then hand the whole directory to the service
-# user. Re-runs keep the existing identity.
-"$BIN" pubkey -key "$CONF_DIR/identity" >/dev/null
-chown -R "$SVC" "$CONF_DIR"
-say "wrote $CONF_DIR/agent.json"
-
-# --- service ----------------------------------------------------------------
-
-case "$INIT" in
-systemd)
-	cat >"/etc/systemd/system/$SVC.service" <<EOF
-[Unit]
-Description=Omenight reverse tunnel agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$SVC
-ExecStart=$BIN run -config $CONF_DIR/agent.json
-Restart=always
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$CONF_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-	systemctl daemon-reload
-	systemctl enable "$SVC" >/dev/null 2>&1 || true
-	[ "$START" = 1 ] && systemctl restart "$SVC"
-	;;
-openrc)
-	cat >"/etc/init.d/$SVC" <<EOF
-#!/sbin/openrc-run
-description="Omenight reverse tunnel agent"
-command="$BIN"
-command_args="run -config $CONF_DIR/agent.json"
-command_user="$SVC"
-command_background=true
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="/var/log/$SVC.log"
-error_log="/var/log/$SVC.log"
-depend() { need net; after firewall; }
-start_pre() { checkpath --directory --mode 0750 --owner $SVC /var/log; }
-EOF
-	chmod 0755 "/etc/init.d/$SVC"
-	rc-update add "$SVC" default >/dev/null 2>&1 || true
-	[ "$START" = 1 ] && rc-service "$SVC" restart
-	;;
-runit)
-	mkdir -p "/etc/sv/$SVC"
-	cat >"/etc/sv/$SVC/run" <<EOF
-#!/bin/sh
-exec 2>&1
-exec chpst -u $SVC $BIN run -config $CONF_DIR/agent.json
-EOF
-	chmod 0755 "/etc/sv/$SVC/run"
-	SV_DIR=/var/service
-	[ -d /etc/service ] && SV_DIR=/etc/service
-	ln -sfn "/etc/sv/$SVC" "$SV_DIR/$SVC"
-	[ "$START" = 1 ] && sv restart "$SVC" 2>/dev/null || true
-	;;
-*)
-	say ""
-	say "no supported init system found. run it yourself:"
-	say "  $BIN run -config $CONF_DIR/agent.json"
-	;;
-esac
-
-# --- finish -----------------------------------------------------------------
-
-KEY="$("$BIN" pubkey -key "$CONF_DIR/identity")"
-say ""
-say "installed. approve this node on the relay:"
-say ""
-say "  omenight-relay approve -name $NAME"
-say ""
-say "the relay assigns it a listen port; 'omenight-relay clients' shows which."
-say ""
-say "$KEY"
+main "$@" </dev/null

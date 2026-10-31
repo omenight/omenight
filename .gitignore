@@ -2,12 +2,8 @@
 /bin/
 /dist/
 
-# Local runtime state (anchor to repo root: a bare "identity" also matches
-# internal/identity/ and silently drops the package)
+# Local runtime state
 *.log
 /state.json
 /state.json.tmp
-/relay_hostkey
-/identity
-/known_hosts
 /control.sock

@@ -1,46 +1,52 @@
 # omenight
 
-Reverse TCP tunnels over SSH. A small agent on a box at home dials a relay and
-exposes a SOCKS proxy on the relay's loopback, so traffic exits from that box's
-network. The relay is a control plane; the data plane is stock SSH channels.
+Exit nodes behind one relay, over AmneziaWG. The relay gives every node its
+own interface and fwmark, so Xray (or anything that can mark a socket) picks
+the node a client leaves through. The node only forwards the relay's traffic
+out of its WAN, its own routing stays as it was.
 
 ```
-node ──ssh──▶ relay:2223     node: SOCKS5 on a random loopback port
-                             relay: binds 127.0.0.1:20000 for it
+xray outbound, mark 7701 ──▶ relay om1 ══awg══▶ node ──masquerade──▶ internet
 ```
 
-## Install a node
+## Relay
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/omenight/omenight/main/install.sh \
-  | sudo sh -s -- --relay relay.example.com:2223 --name node-a
+omenight-relay init -endpoint home.omenight.com   # once, -kind wg for plain WireGuard
+systemctl enable --now omenight-relay             # deploy/omenight-relay.service
+
+omenight-relay add -name archer-ax23              # prints the block to paste on the node
+omenight-relay tui                                # live view, a/x approve/revoke
 ```
 
-Static binary, no dependencies, detects arch and init system (systemd, OpenRC,
-runit). The name defaults to the hostname. `wget -qO- <url> | sudo sh` works too.
+`add` prints the Xray outbound too. A node can be `revoke`d (peer dropped,
+marked traffic blackholed) and `approve`d back, or `remove`d (slot freed, an
+uninstall block printed). `show -name N` prints the block again, `-conf` the
+plain awg-quick file, `-xray` the outbound.
 
-## Run the relay
+Needs the AmneziaWG kernel module and `awg` from amneziawg-tools, or for
+`-kind wg` just `wg`. Runs as root with only `CAP_NET_ADMIN`.
 
-```sh
-./omenight-relay serve -addr 0.0.0.0:2223 -state state.json -hostkey hostkey
+## Node
 
-omenight-relay approve -name node-a    # assigns 127.0.0.1:20000
-omenight-relay tui                     # live view, a/x approve/revoke
-curl --socks5-hostname 127.0.0.1:20000 https://ifconfig.me/ip
-```
+Paste the block from `add` into a root shell. It carries the node's config
+and the installer, needs nothing but `sh`, and is safe to paste again.
 
-Ports are assigned by the relay, so a node only needs an address and a name.
+- OpenWrt: uci interface, a firewall zone that may only forward to `wan`,
+  packages via apk/opkg if missing.
+- Other Linux: `awg-quick@omenight` (systemd) with nftables rules for
+  masquerade, LAN block and ssh-only input.
 
 ## Notes
 
-- TCP only. SSH has no datagrams, so no UDP or QUIC.
-- Listeners bind loopback. A public SOCKS port is an open proxy, and a node's
-  SOCKS reaches its whole LAN.
-- 4.9 MB static arm64 agent, ~6 MB RSS, ~93 Mbps per tunnel, +250 ms per page.
+- IPv4 only. Marked IPv6 is blackholed on the relay instead of leaking.
+- One UDP port per node (`51820+N`). Open them if the relay has a firewall.
+- Ports, addresses and marks derive from settings fixed at `init`.
 
 ## Build
 
 ```sh
-make dist   # arm64 agent, amd64 relay
+make relay   # bin/omenight-relay
 make test
+make e2e     # namespaces, real kernel, no root
 ```

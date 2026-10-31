@@ -4,13 +4,20 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=omenight
+# Root so the daemon and the root CLI share the state file. The bounding set
+# keeps only interface, route and rule management.
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 StateDirectory=omenight
+StateDirectoryMode=0700
 RuntimeDirectory=omenight
 ExecStart=/usr/local/bin/omenight-relay serve \
-	-addr 0.0.0.0:2223 \
 	-state /var/lib/omenight/state.json \
-	-hostkey /var/lib/omenight/hostkey \
 	-socket /run/omenight/control.sock
 Restart=always
 RestartSec=2

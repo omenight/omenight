@@ -1,92 +1,158 @@
 package admin
 
 import (
-	"errors"
 	"fmt"
-	"net"
-	"strconv"
+	"strings"
 
+	"omenight"
 	"omenight/internal/store"
+	"omenight/internal/wg"
 )
 
-// DefaultPortBase is where listen-port allocation starts. Ports are handed
-// out sequentially and never reused while the client exists.
-const DefaultPortBase = 20000
+const (
+	DefaultNet      = "10.77.0.0/16"
+	DefaultPortBase = 51820
+	DefaultMarkBase = 7700
+	DefaultPrefix   = "om"
+)
 
-const portSpan = 1000
-
-// Admin is the control plane: the operations behind the CLI and the TUI.
-// Both go through it so a port is never allocated twice.
+// Admin is the control plane, the operations behind the CLI and the TUI.
+// Both go through it, so keys and slots are made in one place.
 type Admin struct {
-	st   *store.Store
-	base int
+	st *store.Store
 }
 
-func New(st *store.Store, base int) *Admin {
-	if base == 0 {
-		base = DefaultPortBase
-	}
-	return &Admin{st: st, base: base}
-}
+func New(st *store.Store) *Admin { return &Admin{st: st} }
 
-// Approve activates a client and, if it has no listen address yet, gives it
-// the lowest free port from the allocation range. The port is persisted, so
-// it survives reconnects and restarts.
-func (a *Admin) Approve(name string) (store.Client, error) {
-	c, ok := a.st.ByName(name)
-	if !ok {
-		return store.Client{}, fmt.Errorf("%s: no such client (has it connected yet?)", name)
+// Init creates the relay key and, for AWG, the obfuscation params every node
+// will share.
+func (a *Admin) Init(set store.Settings) (store.Settings, error) {
+	key, err := wg.GenerateKey()
+	if err != nil {
+		return set, err
 	}
-	if len(c.Allow) == 0 {
-		addr, err := a.allocate()
+	set.PrivateKey = key
+	if set.Kind == wg.KindAWG {
+		p, err := wg.NewParams()
 		if err != nil {
-			return store.Client{}, err
+			return set, err
 		}
-		if c, err = a.st.Allow(name, addr); err != nil {
-			return store.Client{}, err
-		}
+		set.AWG = &p
 	}
+	return set, a.st.Init(set)
+}
+
+// Add makes the node's key pair here, so the paste block is all the node
+// needs and nothing travels back.
+func (a *Admin) Add(name string) (store.Client, error) {
+	priv, err := wg.GenerateKey()
+	if err != nil {
+		return store.Client{}, err
+	}
+	pub, err := wg.PublicKey(priv)
+	if err != nil {
+		return store.Client{}, err
+	}
+	return a.st.Add(name, priv, pub)
+}
+
+func (a *Admin) Approve(name string) (store.Client, error) {
 	return a.st.SetStatus(name, store.StatusActive)
 }
 
 func (a *Admin) Revoke(name string) (store.Client, error) {
-	if _, ok := a.st.ByName(name); !ok {
-		return store.Client{}, fmt.Errorf("%s: no such client", name)
-	}
 	return a.st.SetStatus(name, store.StatusRevoked)
 }
 
-// Allow grants an extra listen address on top of the assigned one.
-func (a *Admin) Allow(name, addr string) (store.Client, error) {
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		return store.Client{}, fmt.Errorf("bad address %q", addr)
-	}
-	return a.st.Allow(name, addr)
+func (a *Admin) Remove(name string) (store.Client, error) {
+	return a.st.Remove(name)
 }
 
-// allocate finds a port nobody else is using and that can actually be bound.
-func (a *Admin) allocate() (string, error) {
-	used := map[int]bool{}
-	for _, c := range a.st.All() {
-		for _, addr := range c.Allow {
-			if host, port, err := net.SplitHostPort(addr); err == nil && host == "127.0.0.1" {
-				if n, err := strconv.Atoi(port); err == nil {
-					used[n] = true
-				}
-			}
+// Links is what the kernel should look like. A revoked node keeps its
+// interface without a peer, so traffic marked for it is dropped, not leaked.
+func Links(set store.Settings, clients []store.Client) []wg.Link {
+	out := make([]wg.Link, 0, len(clients))
+	for _, c := range clients {
+		l := wg.Link{
+			Name:    set.Iface(c.Slot),
+			Port:    set.Port(c.Slot),
+			Mark:    set.Mark(c.Slot),
+			Address: set.RelayAddr(c.Slot),
 		}
+		if c.Status == store.StatusActive {
+			l.Peer = c.PublicKey
+		}
+		out = append(out, l)
 	}
-	for i := 0; i < 64; i++ {
-		p := store.NextFreePort(a.base, portSpan, used)
-		if p == 0 {
-			return "", errors.New("no free port left in the allocation range")
-		}
-		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
-		if err == nil {
-			ln.Close()
-			return fmt.Sprintf("127.0.0.1:%d", p), nil
-		}
-		used[p] = true
+	return out
+}
+
+func Manager(set store.Settings, run wg.Runner, ipv6 bool) *wg.Manager {
+	return &wg.Manager{
+		Run:        run,
+		Kind:       set.Kind,
+		Prefix:     set.Prefix,
+		PrivateKey: set.PrivateKey,
+		Params:     set.AWG,
+		IPv6:       ipv6,
 	}
-	return "", errors.New("no free port left in the allocation range")
+}
+
+// Conf is the node's awg-quick file. Table = off and a /32 AllowedIPs keep
+// the node's own traffic out of the tunnel, it only ever answers the relay.
+func Conf(set store.Settings, c store.Client) (string, error) {
+	relayPub, err := wg.PublicKey(set.PrivateKey)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "# omenight node %s\n", c.Name)
+	fmt.Fprintf(&b, "[Interface]\nPrivateKey = %s\nAddress = %s\nTable = off\n", c.PrivateKey, set.NodeAddr(c.Slot))
+	if p := set.AWG; p != nil {
+		fmt.Fprintf(&b, "Jc = %d\nJmin = %d\nJmax = %d\nS1 = %d\nS2 = %d\nH1 = %d\nH2 = %d\nH3 = %d\nH4 = %d\n",
+			p.Jc, p.Jmin, p.Jmax, p.S1, p.S2, p.H1, p.H2, p.H3, p.H4)
+	}
+	fmt.Fprintf(&b, "\n[Peer]\nPublicKey = %s\nEndpoint = %s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n",
+		relayPub, set.EndpointFor(c.Slot), set.RelayAddr(c.Slot).Addr())
+	return b.String(), nil
+}
+
+// Delim closes the paste heredoc, so it must never be a line of the installer.
+const Delim = "OMENIGHT"
+
+// Paste is the block to paste into a root shell on the node. It is plain text
+// because OpenWrt's busybox has no base64.
+func Paste(set store.Settings, c store.Client) (string, error) {
+	conf, err := Conf(set, c)
+	if err != nil {
+		return "", err
+	}
+	return wrap("OMENIGHT_CONF='" + conf + "'"), nil
+}
+
+// UninstallPaste undoes Paste on the node.
+func UninstallPaste() string { return wrap("OMENIGHT_ACTION=uninstall") }
+
+func wrap(head string) string {
+	var b strings.Builder
+	b.WriteString("sh <<'" + Delim + "'\n" + head + "\n")
+	for _, ln := range strings.Split(omenight.InstallScript, "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		b.WriteString(ln + "\n")
+	}
+	b.WriteString(Delim + "\n")
+	return b.String()
+}
+
+// Xray is the outbound that sends a client's traffic out through this node.
+func Xray(set store.Settings, c store.Client) string {
+	return fmt.Sprintf(`{
+  "tag": %q,
+  "protocol": "freedom",
+  "settings": {"domainStrategy": "UseIPv4"},
+  "streamSettings": {"sockopt": {"mark": %d}}
+}`, c.Name, set.Mark(c.Slot))
 }

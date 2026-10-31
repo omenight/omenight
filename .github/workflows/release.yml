@@ -26,17 +26,11 @@ jobs:
         run: |
           set -eu
           mkdir -p dist
-          LDFLAGS="-s -w"
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags="$LDFLAGS" \
-              -o dist/omenight-agent-linux-$arch ./cmd/omenight-agent
-            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags="$LDFLAGS" \
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags="-s -w" \
               -o dist/omenight-relay-linux-$arch ./cmd/omenight-relay
           done
-          for arm in 6 7; do
-            CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=$arm go build -trimpath -ldflags="$LDFLAGS" \
-              -o dist/omenight-agent-linux-armv$arm ./cmd/omenight-agent
-          done
+          cp install.sh dist/
           cd dist && sha256sum ./* > SHA256SUMS && cat SHA256SUMS
 
       - uses: softprops/action-gh-release@v2

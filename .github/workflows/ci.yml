@@ -20,6 +20,5 @@ jobs:
       - run: gofmt -l . | tee /dev/stderr | (! read -r _)
       - run: go vet ./...
       - run: go test ./...
-      - run: |
-          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" ./cmd/omenight-agent
-          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" ./cmd/omenight-relay
+      - run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" ./cmd/omenight-relay
+      - run: sh -n install.sh

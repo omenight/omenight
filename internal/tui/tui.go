@@ -16,7 +16,6 @@ var (
 	styDim     = lipgloss.NewStyle().Faint(true)
 	styHead    = lipgloss.NewStyle().Bold(true).Faint(true)
 	styOnline  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	styPending = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	styRevoked = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	styErr     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 )
@@ -147,34 +146,35 @@ func (m Model) View() string {
 	s := m.snap
 	up := time.Since(s.StartedAt).Round(time.Second)
 	b.WriteString(styTitle.Render(" omenight relay ") +
-		styDim.Render(s.Listen) + "   " + styDim.Render("up "+up.String()) + "\n")
-	b.WriteString(styDim.Render(" host key "+s.HostKey) + "\n\n")
+		styDim.Render(s.Endpoint+" ("+s.Kind+")") + "   " + styDim.Render("up "+up.String()) + "\n")
+	b.WriteString(styDim.Render(" public key "+s.PublicKey) + "\n\n")
 
 	if m.err != nil {
 		b.WriteString(styErr.Render(" "+m.err.Error()) + "\n")
 	}
+	if s.SyncError != "" {
+		b.WriteString(styErr.Render(" sync: "+trunc(s.SyncError, 200)) + "\n")
+	}
 
 	if len(s.Clients) == 0 {
-		b.WriteString(styDim.Render(" no clients enrolled yet — waiting for a node to connect") + "\n")
+		b.WriteString(styDim.Render(" no nodes yet, add one with `omenight-relay add -name NAME`") + "\n")
 	} else {
-		row := "%s%-14s %-8s %-6s %5s %8s %8s  %-22s %s"
+		row := "%s%-14s %-8s %-6s %-6s %-12s %-21s %8s %8s  %s"
 		b.WriteString(styHead.Render(fmt.Sprintf(row,
-			"  ", "NAME", "STATUS", "ONLINE", "CONNS", "UP", "DOWN", "ALLOW", "LAST SEEN")) + "\n")
+			"  ", "NAME", "STATUS", "ONLINE", "IFACE", "NODE", "ENDPOINT", "RX", "TX", "HANDSHAKE")) + "\n")
 
 		for i, c := range s.Clients {
 			online := "no"
 			if c.Online {
 				online = "yes"
 			}
-			allow := strings.Join(c.Allow, ",")
-			if allow == "" {
-				allow = "-"
+			endpoint := c.Endpoint
+			if endpoint == "" {
+				endpoint = "-"
 			}
 			seen := "-"
-			if c.Online {
-				seen = "now"
-			} else if !c.LastSeen.IsZero() {
-				seen = time.Since(c.LastSeen).Round(time.Second).String() + " ago"
+			if !c.Handshake.IsZero() {
+				seen = time.Since(c.Handshake).Round(time.Second).String() + " ago"
 			}
 
 			marker := "  "
@@ -182,9 +182,8 @@ func (m Model) View() string {
 				marker = "› "
 			}
 			line := fmt.Sprintf(row, marker,
-				trunc(c.Name, 14), c.Status, online,
-				fmt.Sprint(c.Conns), human(c.Up), human(c.Down),
-				trunc(allow, 22), seen)
+				trunc(c.Name, 14), c.Status, online, c.Iface, c.Address,
+				trunc(endpoint, 21), human(c.Rx), human(c.Tx), seen)
 
 			style := statusColor(c.Status)
 			if i == m.cursor {
@@ -205,8 +204,6 @@ func statusColor(status string) lipgloss.Style {
 	switch status {
 	case "active":
 		return styOnline
-	case "pending":
-		return styPending
 	case "revoked":
 		return styRevoked
 	}
