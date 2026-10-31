@@ -31,8 +31,13 @@ type Config struct {
 	KeyPath    string   `json:"key,omitempty"`
 	KnownHosts string   `json:"known_hosts,omitempty"`
 	Socks      string   `json:"socks,omitempty"`
+	Egress     bool     `json:"egress,omitempty"`
 	Tunnels    []Tunnel `json:"forwards,omitempty"`
 	Verbose    bool     `json:"verbose,omitempty"`
+
+	// EgressTarget is the local SOCKS address every grant is forwarded to.
+	// Filled at startup, never read from the config file.
+	EgressTarget string `json:"-"`
 }
 
 // LoadConfig reads the file the installer writes.
@@ -118,11 +123,7 @@ func (a *Agent) runOnce(ctx context.Context) error {
 	}
 
 	s := &session{conn: cc, cfg: a.cfg, targets: map[string]string{}}
-	for _, t := range a.cfg.Tunnels {
-		s.targets[t.Listen] = t.Target
-	}
 
-	go s.handleChannels(chans)
 	go s.handleRequests(reqs)
 	go s.keepalive(ctx)
 
@@ -160,6 +161,20 @@ func (a *Agent) runOnce(ctx context.Context) error {
 	} else {
 		log.Printf("connected, granted %v", msg.Config.Granted)
 	}
+
+	// Build the mapping only once the relay has told us what to bind. In
+	// egress mode we have no opinion: every granted port goes to the local
+	// SOCKS address.
+	if a.cfg.EgressTarget != "" {
+		for _, g := range msg.Config.Granted {
+			s.targets[g] = a.cfg.EgressTarget
+		}
+	} else {
+		for _, t := range a.cfg.Tunnels {
+			s.targets[t.Listen] = t.Target
+		}
+	}
+	go s.handleChannels(chans)
 
 	for _, addr := range msg.Config.Granted {
 		if err := s.forward(addr); err != nil {

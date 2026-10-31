@@ -29,24 +29,27 @@ service.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/omenight/omenight/main/install.sh \
-  | sudo sh -s -- --relay relay.example.com:2223 --egress 1085
+  | sudo sh -s -- --relay relay.example.com:2223 --name node-a
 ```
 
-That is the whole install for an exit node: SOCKS5 on `127.0.0.1:1080` on the
-node, forwarded to `127.0.0.1:1085` on the relay. The client name defaults to
-the machine's hostname; pass `--name` to override. No curl on the box? Use
-`wget -qO- <url> | sudo sh -s -- ...`.
+Two values and nothing else. The name defaults to the machine's hostname, so
+`--relay` alone is enough; everything else is chosen at runtime. No curl on
+the box? Use `wget -qO- <url> | sudo sh -s -- ...`.
 
 It prints the node's public key. Approve it on the relay:
 
 ```sh
-omenight-relay approve -name box
-omenight-relay allow   -name box -addr 127.0.0.1:1085
+omenight-relay approve -name node-a
 ```
 
+Approving also assigns a stable listen port (`20000`, `20001`, ...), shown by
+`omenight-relay clients` and the TUI. The agent runs SOCKS5 on a random
+loopback port and forwards the assigned port to it, so there is no port
+bookkeeping anywhere: one relay address, one name, per node.
+
 Then, from the relay:
-`curl --socks5-hostname 127.0.0.1:1085 https://ifconfig.me/ip` (`socks5h` so
-DNS resolves on the node).
+`curl --socks5-hostname 127.0.0.1:20000 https://ifconfig.me/ip`
+(`socks5h` so DNS resolves on the node).
 
 For anything other than an egress node, be explicit: `--socks
 127.0.0.1:1080 --forward 127.0.0.1:1085=127.0.0.1:1080` (repeatable).
@@ -65,9 +68,9 @@ go build -o omenight-relay ./cmd/omenight-relay
 A systemd unit is in `deploy/omenight-relay.service`.
 
 ```sh
-omenight-relay clients                              # enrolled nodes
-omenight-relay approve  -name node-a
-omenight-relay allow    -name node-a -addr 127.0.0.1:1085
+omenight-relay clients                              # enrolled nodes and ports
+omenight-relay approve  -name node-a                # activates + assigns a port
+omenight-relay allow    -name node-a -addr 127.0.0.1:2100   # extra listen addr
 omenight-relay revoke   -name node-a                # also kills live sessions
 ```
 

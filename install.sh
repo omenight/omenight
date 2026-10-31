@@ -1,8 +1,8 @@
 #!/bin/sh
 # omenight agent installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/omenight/omenight/main/install.sh | sh -s -- \
-#     --relay relay.example.com:2223 --name node-a --forward 127.0.0.1:1085=127.0.0.1:1080
+#   curl -fsSL https://raw.githubusercontent.com/omenight/omenight/main/install.sh \
+#     | sh -s -- --relay relay.example.com:2223 --name node-a
 #
 # Runs on any distro with a POSIX shell. Detects architecture and init
 # system, installs one static binary, writes a config, and prints the public
@@ -22,7 +22,6 @@ SOCKS=""
 VERSION=""
 FROM=""
 FORWARDS=""
-EGRESS=""
 UNINSTALL=0
 PURGE=0
 START=1
@@ -37,9 +36,8 @@ omenight agent installer
 
   --relay HOST:PORT       relay address (required)
   --name NAME             client name, the SSH username (default: hostname)
-  --forward L=T           forward relay L to local T (repeatable)
-  --egress PORT           shorthand: SOCKS on 127.0.0.1:1080, forward PORT to it
-  --socks ADDR            run the built-in SOCKS5 server, e.g. 127.0.0.1:1080
+  --forward L=T           manual mode: forward relay L to local T (repeatable)
+  --socks ADDR            manual mode: run SOCKS5 on this fixed address
   --version TAG           install a specific release (default: latest)
   --from PATH             install a local binary instead of downloading
   --no-start              install but do not start the service
@@ -47,7 +45,9 @@ omenight agent installer
   --purge                 with --uninstall, also remove $CONF_DIR
 
 Examples:
-  --forward 127.0.0.1:1085=127.0.0.1:1080 --socks 127.0.0.1:1080
+  egress node (default):  --relay relay.example.com:2223 --name node-a
+  explicit ports:         --relay ... --name node-a \
+                          --socks 127.0.0.1:1080 --forward 127.0.0.1:1085=127.0.0.1:1080
 EOF
 }
 
@@ -56,7 +56,6 @@ while [ $# -gt 0 ]; do
 	--relay) RELAY="${2:?}"; shift 2 ;;
 	--name) NAME="${2:?}"; shift 2 ;;
 	--forward) FORWARDS="$FORWARDS $2"; shift 2 ;;
-	--egress) EGRESS="${2:?}"; shift 2 ;;
 	--socks) SOCKS="${2:?}"; shift 2 ;;
 	--version) VERSION="${2:?}"; shift 2 ;;
 	--from) FROM="${2:?}"; shift 2 ;;
@@ -147,12 +146,6 @@ do_uninstall() {
 
 [ "$UNINSTALL" = 1 ] && do_uninstall
 
-# --egress is the common case: an exit node serving SOCKS.
-if [ -n "$EGRESS" ]; then
-	[ -n "$SOCKS" ] || SOCKS="127.0.0.1:1080"
-	FORWARDS="$FORWARDS 127.0.0.1:$EGRESS=$SOCKS"
-fi
-
 # Interactive fallback when values are missing.
 if [ -z "$RELAY" ] && [ -t 0 ]; then
 	printf 'relay address (host:port): '
@@ -212,17 +205,24 @@ for f in $FORWARDS; do
     {\"listen\": \"$L\", \"target\": \"$T\"}"
 done
 
+# Default is an egress node: the relay assigns the listen port and the agent
+# picks its own loopback SOCKS port, so there is nothing to configure.
+EGRESS_MODE=1
+if [ -n "$SOCKS" ] || [ -n "$FORWARD_JSON" ]; then
+	EGRESS_MODE=0
+fi
+
 {
 	printf '{\n'
 	printf '  "relay": "%s",\n' "$RELAY"
 	printf '  "name": "%s",\n' "$NAME"
 	printf '  "key": "%s/identity",\n' "$CONF_DIR"
 	printf '  "known_hosts": "%s/known_hosts",\n' "$CONF_DIR"
-	[ -n "$SOCKS" ] && printf '  "socks": "%s",\n' "$SOCKS"
-	if [ -n "$FORWARD_JSON" ]; then
-		printf '  "forwards": [%s\n  ]\n' "$FORWARD_JSON"
+	if [ "$EGRESS_MODE" = 1 ]; then
+		printf '  "egress": true\n'
 	else
-		printf '  "forwards": []\n'
+		[ -n "$SOCKS" ] && printf '  "socks": "%s",\n' "$SOCKS"
+		printf '  "forwards": [%s\n  ]\n' "$FORWARD_JSON"
 	fi
 	printf '}\n'
 } >"$CONF_DIR/agent.json.tmp"
@@ -307,9 +307,10 @@ esac
 
 KEY="$("$BIN" pubkey -key "$CONF_DIR/identity")"
 say ""
-say "installed. approve this key on the relay:"
+say "installed. approve this node on the relay:"
 say ""
 say "  omenight-relay approve -name $NAME"
-say "  omenight-relay allow   -name $NAME -addr <listen addr>"
+say ""
+say "the relay assigns it a listen port; 'omenight-relay clients' shows which."
 say ""
 say "$KEY"

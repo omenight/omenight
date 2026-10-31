@@ -392,6 +392,16 @@ func (s *session) grant(want []string) ([]string, string) {
 	if !ok {
 		return nil, "unknown client"
 	}
+	// An empty request means "whatever I was allowed": that is how egress
+	// nodes work, because the relay owns the port number and the agent has
+	// no opinion about it.
+	if len(want) == 0 {
+		if len(cl.Allow) == 0 {
+			return nil, "no allowed tunnels"
+		}
+		return append([]string(nil), cl.Allow...), ""
+	}
+
 	var out []string
 	for _, w := range want {
 		for _, a := range cl.Allow {

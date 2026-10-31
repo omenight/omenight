@@ -209,6 +209,16 @@ func (s *Store) Touch(fp string) {
 	}
 }
 
+// NextFreePort returns the lowest port in [base, base+span) not in used, or 0.
+func NextFreePort(base, span int, used map[int]bool) int {
+	for p := base; p < base+span; p++ {
+		if !used[p] {
+			return p
+		}
+	}
+	return 0
+}
+
 // Flush persists in-memory changes (call on shutdown).
 func (s *Store) Flush() error {
 	s.mu.Lock()

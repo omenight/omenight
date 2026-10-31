@@ -50,6 +50,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `omenight-agent - reverse tunnel node
 
   run     -config /etc/omenight/agent.json
+  run     -relay HOST:PORT -name NAME -egress
   run     -relay HOST:PORT -name NAME -forward 127.0.0.1:1085=127.0.0.1:1080
   pubkey  -key %s/identity
 `, configDir())
@@ -64,6 +65,7 @@ func run(args []string) {
 	keyPath := fs.String("key", "", "identity file")
 	knownHosts := fs.String("known-hosts", "", "pinned relay host key")
 	socksAddr := fs.String("socks", "", "run the built-in SOCKS5 server on this address")
+	egress := fs.Bool("egress", false, "SOCKS5 on a random loopback port, forwarding every grant to it")
 	verbose := fs.Bool("v", false, "log every connection")
 	var forwards stringList
 	fs.Var(&forwards, "forward", "listen=target, repeatable")
@@ -96,6 +98,9 @@ func run(args []string) {
 	if set["socks"] {
 		cfg.Socks = *socksAddr
 	}
+	if set["egress"] {
+		cfg.Egress = *egress
+	}
 	if set["v"] {
 		cfg.Verbose = *verbose
 	}
@@ -119,16 +124,22 @@ func run(args []string) {
 	if cfg.KnownHosts == "" {
 		cfg.KnownHosts = filepath.Join(configDir(), "known_hosts")
 	}
-	if len(cfg.Tunnels) == 0 && cfg.Socks == "" {
-		log.Fatal("nothing to do: give -forward or -socks")
+	if !cfg.Egress && cfg.Socks == "" && len(cfg.Tunnels) == 0 {
+		log.Fatal("nothing to do: give -egress, -socks or -forward")
 	}
 
+	// Egress mode picks its own loopback port: nothing outside this process
+	// ever dials it, so there is no reason to make it configurable.
+	if cfg.Egress && cfg.Socks == "" {
+		cfg.Socks = "127.0.0.1:0"
+	}
 	if cfg.Socks != "" {
 		srv, err := socks.Listen(cfg.Socks, cfg.Verbose)
 		if err != nil {
 			log.Fatalf("socks: %v", err)
 		}
-		log.Printf("socks5 on %s", srv.Addr())
+		cfg.EgressTarget = srv.Addr().String()
+		log.Printf("socks5 on %s", cfg.EgressTarget)
 		go srv.Serve()
 	}
 

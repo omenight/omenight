@@ -72,3 +72,19 @@ func TestEnrollmentFlow(t *testing.T) {
 		t.Fatalf("duplicate allow entry: %v", got.Allow)
 	}
 }
+
+func TestNextFreePort(t *testing.T) {
+	used := map[int]bool{}
+	if got := NextFreePort(20000, 3, used); got != 20000 {
+		t.Fatalf("want 20000, got %d", got)
+	}
+	used[20000] = true
+	used[20001] = true
+	if got := NextFreePort(20000, 3, used); got != 20002 {
+		t.Fatalf("want 20002, got %d", got)
+	}
+	used[20002] = true
+	if got := NextFreePort(20000, 3, used); got != 0 {
+		t.Fatalf("want exhaustion (0), got %d", got)
+	}
+}
