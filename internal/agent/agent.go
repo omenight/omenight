@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -20,17 +21,31 @@ import (
 )
 
 type Tunnel struct {
-	Listen string // address to bind on the relay
-	Target string // address to dial from this node
+	Listen string `json:"listen"` // address to bind on the relay
+	Target string `json:"target"` // address to dial from this node
 }
 
 type Config struct {
-	Name       string
-	Relay      string
-	KeyPath    string
-	KnownHosts string
-	Tunnels    []Tunnel
-	Verbose    bool
+	Name       string   `json:"name"`
+	Relay      string   `json:"relay"`
+	KeyPath    string   `json:"key,omitempty"`
+	KnownHosts string   `json:"known_hosts,omitempty"`
+	Socks      string   `json:"socks,omitempty"`
+	Tunnels    []Tunnel `json:"forwards,omitempty"`
+	Verbose    bool     `json:"verbose,omitempty"`
+}
+
+// LoadConfig reads the file the installer writes.
+func LoadConfig(path string) (Config, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+	var c Config
+	if err := json.Unmarshal(b, &c); err != nil {
+		return Config{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return c, nil
 }
 
 type Agent struct {

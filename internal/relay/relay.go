@@ -1,15 +1,21 @@
 package relay
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"omenight/internal/api"
 	"omenight/internal/identity"
 	"omenight/internal/proto"
 	"omenight/internal/store"
@@ -22,12 +28,14 @@ type Config struct {
 	Addr    string
 	HostKey string
 	State   string
+	Socket  string
 }
 
 type Relay struct {
-	cfg    Config
-	signer ssh.Signer
-	store  *store.Store
+	cfg     Config
+	signer  ssh.Signer
+	store   *store.Store
+	started time.Time
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -46,6 +54,7 @@ func New(cfg Config) (*Relay, error) {
 		cfg:      cfg,
 		signer:   signer,
 		store:    st,
+		started:  time.Now(),
 		sessions: map[string]*session{},
 	}, nil
 }
@@ -64,6 +73,10 @@ func (r *Relay) Serve() error {
 	log.Printf("relay listening on %s (host key %s)", ln.Addr(), r.HostKeyFingerprint())
 
 	go r.watch()
+
+	if r.cfg.Socket != "" {
+		go r.serveSocket(r.cfg.Socket)
+	}
 
 	for {
 		c, err := ln.Accept()
@@ -155,6 +168,7 @@ func (r *Relay) handle(tc net.Conn) {
 		name:     sc.Permissions.Extensions["name"],
 		fp:       sc.Permissions.Extensions["fp"],
 		status:   sc.Permissions.Extensions["status"],
+		started:  time.Now(),
 		lastSeen: time.Now(),
 		forwards: map[string]net.Listener{},
 		done:     make(chan struct{}),
@@ -179,6 +193,88 @@ func (r *Relay) handle(tc net.Conn) {
 		go ssh.DiscardRequests(chReqs)
 		go s.handleControl(ch)
 	}
+}
+
+// Snapshot is the live view the TUI and CLI read.
+func (r *Relay) Snapshot() api.Snapshot {
+	snap := api.Snapshot{
+		Listen:    r.cfg.Addr,
+		Version:   proto.Version,
+		HostKey:   r.HostKeyFingerprint(),
+		StartedAt: r.started,
+	}
+	live := map[string]*session{}
+	for _, s := range r.snapshot() {
+		live[s.name] = s
+	}
+	for _, c := range r.store.All() {
+		info := api.Client{
+			Name:     c.Name,
+			Status:   c.Status,
+			Allow:    c.Allow,
+			LastSeen: c.LastSeen,
+		}
+		if s, ok := live[c.Name]; ok {
+			info.Online = true
+			info.Remote = s.conn.RemoteAddr().String()
+			info.Since = s.started
+			info.Conns = s.conns.Load()
+			info.Up = s.up.Load()
+			info.Down = s.down.Load()
+		}
+		snap.Clients = append(snap.Clients, info)
+	}
+	return snap
+}
+
+// serveSocket publishes snapshots on a unix socket. One request, one
+// document, then close: no protocol to get wrong.
+func (r *Relay) serveSocket(path string) {
+	os.Remove(path)
+	if err := os.MkdirAll(dirOf(path), 0o755); err != nil {
+		log.Printf("api: %v", err)
+		return
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		log.Printf("api: %v (TUI disabled)", err)
+		return
+	}
+	os.Chmod(path, 0o600)
+	log.Printf("api on %s", path)
+
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+
+			// Serve both a bare JSON client and `curl --unix-socket`.
+			br := bufio.NewReader(c)
+			c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			line, _ := br.ReadString('\n')
+			c.SetReadDeadline(time.Time{})
+			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+
+			if strings.HasPrefix(line, "GET ") {
+				fmt.Fprint(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+			}
+			if err := json.NewEncoder(c).Encode(r.Snapshot()); err != nil {
+				return
+			}
+		}(c)
+	}
+}
+
+func dirOf(p string) string {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' {
+			return p[:i]
+		}
+	}
+	return "."
 }
 
 func (r *Relay) addSession(s *session) bool {
@@ -208,11 +304,16 @@ func (r *Relay) dropSession(s *session) {
 }
 
 type session struct {
-	r      *Relay
-	conn   *ssh.ServerConn
-	name   string
-	fp     string
-	status string
+	r       *Relay
+	conn    *ssh.ServerConn
+	name    string
+	fp      string
+	status  string
+	started time.Time
+
+	conns atomic.Int64
+	up    atomic.Int64
+	down  atomic.Int64
 
 	mu       sync.Mutex
 	granted  []string
@@ -399,7 +500,13 @@ func (s *session) pipe(c net.Conn, bindAddr string, port int) {
 		return
 	}
 	go ssh.DiscardRequests(chReqs)
-	xio.Splice(c, ch)
+
+	s.conns.Add(1)
+	defer s.conns.Add(-1)
+
+	up, down := xio.Splice(c, ch)
+	s.up.Add(up)
+	s.down.Add(down)
 	ch.Close()
 }
 

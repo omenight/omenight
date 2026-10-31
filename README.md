@@ -13,25 +13,77 @@ agent (node)                          relay
   ├ tcpip-forward ──────────────────▶ bind 127.0.0.1:1085
   ├ built-in SOCKS5 on 127.0.0.1:1080
   │◀═══ forwarded-tcpip ══════════════ relay accepts → channel
-  └ dial local target, splice ──────▶ your browser at relay:1085
+  └ dial local target, splice ──────▶ clients at relay:1085
 ```
 
-The relay never learns the destination: it only knows which listen address
-was granted. The SOCKS server lives on the node, so name resolution and
-dialing happen there.
+The relay never learns destinations: it only knows which listen address was
+granted. The SOCKS server lives on the node, so name resolution and dialing
+happen there. Traffic exits from whatever network the node sits on.
 
-## Status
+## Install a node
 
-Working: enrollment by key, admin approval, per-client port allowlist,
-reverse TCP forwarding, heartbeat with half-open detection, reconnect with
-backoff, live policy reload.
+One static binary, no runtime dependencies, works on any distribution with a
+POSIX shell. The script detects architecture and init system (systemd,
+OpenRC, runit), creates a service user, writes the config, and starts the
+service.
 
-Not there yet: UDP (SSH has none), config push without a reconnect, byte
-accounting per tunnel, load balancing, the `disallow` subcommand.
+```sh
+curl -fsSL https://raw.githubusercontent.com/omenight/omenight/main/install.sh \
+  | sudo sh -s -- \
+      --relay relay.example.com:2223 \
+      --name node-a \
+      --socks 127.0.0.1:1080 \
+      --forward 127.0.0.1:1085=127.0.0.1:1080
+```
 
-## Measured on real hardware
+It prints the node's public key. Approve it on the relay:
 
-Node: Alpine 3.24, aarch64, 4 cores, 973 MB RAM, Sochi home link.
+```sh
+omenight-relay approve -name node-a
+omenight-relay allow   -name node-a -addr 127.0.0.1:1085
+```
+
+Then, from the relay: `curl --socks5hostname 127.0.0.1:1085 https://ifconfig.me/ip`
+(`socks5h` so DNS resolves on the node).
+
+Re-running the installer upgrades the binary and keeps the identity. `--from
+./omenight-agent` installs a local build, `--uninstall` removes the service,
+`--purge` also removes `/etc/omenight`.
+
+## Run the relay
+
+```sh
+go build -o omenight-relay ./cmd/omenight-relay
+./omenight-relay serve -addr 0.0.0.0:2223 -state state.json -hostkey hostkey
+```
+
+A systemd unit is in `deploy/omenight-relay.service`.
+
+```sh
+omenight-relay clients                              # enrolled nodes
+omenight-relay approve  -name node-a
+omenight-relay allow    -name node-a -addr 127.0.0.1:1085
+omenight-relay revoke   -name node-a                # also kills live sessions
+```
+
+Approvals take effect on the running daemon within two seconds: it reloads
+the state file and drops sessions whose grants no longer match, so the agent
+reconnects and renegotiates.
+
+## TUI
+
+```sh
+omenight-relay tui
+```
+
+Reads a snapshot per second over the daemon's unix socket
+(`/run/omenight/control.sock`): name, status, online, live connections, bytes
+each way, allowlist, last seen. `r` refreshes, `q` quits. The socket also
+answers `curl --unix-socket /run/omenight/control.sock http://x/` with JSON.
+
+## Measured
+
+Node: Alpine 3.24, aarch64, 4 cores, 973 MB RAM, residential link.
 Relay: Debian 13, x86_64.
 
 | | |
@@ -43,87 +95,34 @@ Relay: Debian 13, x86_64.
 | half-open detection | 30 s, then the port is unbound |
 
 Latency, not bandwidth, is the cost of this design: every origin round trip
-now includes the node's home RTT.
-
-## Quickstart
-
-Relay:
-
-```sh
-go build -o bin/omenight-relay ./cmd/omenight-relay
-./bin/omenight-relay serve -addr 0.0.0.0:2223 -state state.json -hostkey hostkey
-```
-
-Node:
-
-```sh
-go build -o bin/omenight-agent ./cmd/omenight-agent
-./bin/omenight-agent run \
-  -relay relay.example.com:2223 -name pi-sochi \
-  -socks 127.0.0.1:1080 \
-  -forward 127.0.0.1:1085=127.0.0.1:1080
-```
-
-The first connection shows up as `pending`. Approve it:
-
-```sh
-./omenight-relay clients   -state state.json
-./omenight-relay approve   -state state.json -name pi-sochi
-./omenight-relay allow     -state state.json -name pi-sochi -addr 127.0.0.1:1085
-./omenight-relay revoke    -state state.json -name pi-sochi
-```
-
-A live approval drops the session; the agent reconnects within a second and
-picks up the new grants. Revocation does the same and keeps the key out.
-
-Then, from the relay:
-
-```sh
-curl --socks5-hostname 127.0.0.1:1085 https://ifconfig.me/ip
-```
-
-Use `socks5h` so DNS resolves on the node.
-
-## Enroll a node
-
-The SSH username is the client name. The key is the identity, and the
-fingerprint is what gets pinned:
-
-```sh
-./omenight-agent pubkey -key ~/.config/omenight/identity
-```
+includes the node's RTT.
 
 ## Security model
 
-- Ed25519 keys only, no passwords. Revocation is a status flag, enforced at
-  auth and on live sessions.
-- Every listen address must be in the client's `allow` list, and the grant is
-  per session: a valid key cannot bind a port it did not negotiate.
-- Listeners bind as configured. Use `127.0.0.1:PORT` and reach it over your
-  own SSH session or WireGuard — a public SOCKS port is an open proxy.
-- The node's SOCKS port reaches the node's whole LAN at TCP level. Treat it
+- Ed25519 keys only, no passwords. The fingerprint is the identity; the SSH
+  username is a label. Revocation is enforced at auth and on live sessions.
+- Grants are per session: a valid key cannot bind a port it did not negotiate
+  in its `hello`, even if it is in the allowlist.
+- Listeners bind to what you configure. Use `127.0.0.1:PORT` and reach it over
+  your own SSH session or WireGuard — a public SOCKS port is an open proxy.
+- The node's SOCKS port reaches that node's whole LAN at TCP level. Treat it
   like a root password.
-- The relay pins its host key on the agent at first use and refuses changes.
+- The agent pins the relay's host key at first use and refuses changes.
 
-## Deploy
+## Scope
 
-The node in this setup runs Alpine, so it needs OpenRC, not systemd:
+TCP only. SSH has no datagrams, so no UDP, no QUIC, no WireGuard-over-this.
+Browsers fall back to TCP; video works, just without HTTP/3.
 
-```sh
-install -m 0755 dist/omenight-agent-arm64 /usr/local/bin/omenight-agent
-install -m 0755 deploy/omenight-agent.openrc /etc/init.d/omenight-agent
-install -m 0640 deploy/omenight-agent.confd /etc/conf.d/omenight-agent
-rc-update add omenight-agent default
-rc-service omenight-agent start
-```
-
-The relay on Debian: `deploy/omenight-relay.service`.
+Not there yet: config push without a reconnect, `disallow`, load balancing,
+per-tunnel byte persistence, UDP.
 
 ## Build
 
 ```sh
-make dist    # arm64 node + amd64 relay, static, stripped
+make dist   # agent for arm64, relay for amd64
+make test
 ```
 
-No cgo, no runtime dependencies on the node: one static binary plus an
-identity file.
+Static, `CGO_ENABLED=0`, no cgo, no database. State is a JSON file with atomic
+writes.

@@ -8,14 +8,18 @@ import (
 	"text/tabwriter"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"omenight/internal/relay"
 	"omenight/internal/store"
+	"omenight/internal/tui"
 )
 
 const (
 	defState   = "relay-state.json"
 	defHostKey = "relay_hostkey"
-	defAddr    = "0.0.0.0:2222"
+	defAddr    = "0.0.0.0:2223"
+	defSocket  = "/run/omenight/control.sock"
 )
 
 func main() {
@@ -27,6 +31,8 @@ func main() {
 	switch cmd {
 	case "serve":
 		serve(args)
+	case "tui":
+		runTUI(args)
 	case "clients":
 		clients(args)
 	case "approve":
@@ -35,8 +41,6 @@ func main() {
 		setStatus(args, store.StatusRevoked)
 	case "allow":
 		allow(args)
-	case "disallow":
-		fmt.Println("not implemented yet")
 	default:
 		usage()
 	}
@@ -45,12 +49,13 @@ func main() {
 func usage() {
 	fmt.Fprintf(os.Stderr, `omenight-relay - control plane for omenight agents
 
-  serve    -addr :2222 -state %s -hostkey %s
+  serve    -addr %s -state %s -hostkey %s -socket %s
+  tui      -socket %s
   clients  -state %s
   approve  -name NAME -state %s
   revoke   -name NAME -state %s
-  allow    -name NAME -addr 127.0.0.1:1081 -state %s
-`, defState, defHostKey, defState, defState, defState, defState)
+  allow    -name NAME -addr 127.0.0.1:1085 -state %s
+`, defAddr, defState, defHostKey, defSocket, defSocket, defState, defState, defState, defState)
 	os.Exit(2)
 }
 
@@ -59,13 +64,25 @@ func serve(args []string) {
 	addr := fs.String("addr", defAddr, "listen address")
 	state := fs.String("state", defState, "state file")
 	hostkey := fs.String("hostkey", defHostKey, "host key path")
+	socket := fs.String("socket", defSocket, "unix socket for the TUI ('' to disable)")
 	fs.Parse(args)
 
-	r, err := relay.New(relay.Config{Addr: *addr, State: *state, HostKey: *hostkey})
+	r, err := relay.New(relay.Config{Addr: *addr, State: *state, HostKey: *hostkey, Socket: *socket})
 	if err != nil {
 		log.Fatal(err)
 	}
 	if err := r.Serve(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runTUI(args []string) {
+	fs := flag.NewFlagSet("tui", flag.ExitOnError)
+	socket := fs.String("socket", defSocket, "daemon socket")
+	fs.Parse(args)
+
+	p := tea.NewProgram(tui.New(*socket), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -118,7 +135,7 @@ func allow(args []string) {
 	fs := flag.NewFlagSet("allow", flag.ExitOnError)
 	state := fs.String("state", defState, "state file")
 	name := fs.String("name", "", "client name")
-	addr := fs.String("addr", "", "listen address on the relay, e.g. 127.0.0.1:1081")
+	addr := fs.String("addr", "", "listen address on the relay, e.g. 127.0.0.1:1085")
 	fs.Parse(args)
 	if *name == "" || *addr == "" {
 		log.Fatal("-name and -addr are required")
