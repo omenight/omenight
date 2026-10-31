@@ -19,7 +19,7 @@ import (
 	"omenight/internal/wg"
 )
 
-const Version = "0.4.1"
+const Version = "0.4.2"
 
 // The node's keepalive makes WireGuard rekey every two minutes, so a
 // handshake older than this means the node is gone.

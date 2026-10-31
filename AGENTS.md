@@ -81,6 +81,10 @@ Always build with `CGO_ENABLED=0`, the relay binary must be static.
 - `install-relay.sh` holds the only copy of the systemd unit. It downloads
   `omenight-relay-linux-<arch>` and `SHA256SUMS` from the release, so those
   asset names are a contract with `release.yml`.
+- netifd loads protocol handlers only at startup and needs `ubus call network
+  reload` before `ifup` sees a new interface. The installer asks
+  `get_proto_handlers` and restarts the network only when the handler is not
+  loaded. Stubbed dry runs cannot catch either, test on a real router.
 - `install.sh` runs under busybox ash. No bashisms, no `grep -A`, no
   `base64`. Test changes there (`ssh <router> sh < script`) with `uci`,
   `ifup` and the firewall reload stubbed out.

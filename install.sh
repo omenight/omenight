@@ -79,6 +79,10 @@ openwrt_install() {
 		openwrt_packages $pkgs || die "could not install $pkgs, add them by hand and paste again"
 		[ -f "/lib/netifd/proto/$proto.sh" ] || die "$proto netifd support is still missing"
 	fi
+	# netifd loads protocol handlers only at startup, so a freshly installed
+	# one needs a restart. Asking netifd also covers an earlier paste.
+	restart=0
+	ubus call network get_proto_handlers | grep -q "\"$proto\": {" || restart=1
 	z=0
 	while zn=$(uci -q get "firewall.@zone[$z].name"); do
 		[ "$zn" = wan ] && break
@@ -142,7 +146,13 @@ openwrt_install() {
 	uci commit network
 	uci commit firewall
 	/etc/init.d/firewall reload >/dev/null 2>&1
-	ifup "$IFACE"
+	if [ "$restart" = 1 ]; then
+		say "restarting the network to load $proto support, connections drop for a few seconds"
+		/etc/init.d/network restart
+	else
+		ubus call network reload
+		ifup "$IFACE"
+	fi
 }
 
 openwrt_uninstall() {
