@@ -91,7 +91,7 @@ PY
 }
 sleep 0.3
 
-"$R" init -state "$ST" -kind wg -endpoint 192.0.2.1 >/dev/null
+"$R" init -state "$ST" -endpoint 192.0.2.1 >/dev/null
 "$R" add -state "$ST" -name n1 >"$W/paste.sh" 2>/dev/null
 "$R" serve -state "$ST" -socket "$W/c.sock" >"$W/relay.log" 2>&1 &
 sleep 1

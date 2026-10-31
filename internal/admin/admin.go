@@ -98,7 +98,7 @@ func Manager(set store.Settings, run wg.Runner, ipv6 bool) *wg.Manager {
 	}
 }
 
-// Conf is the node's awg-quick file. Table = off and a /32 AllowedIPs keep
+// Conf is the node's wg-quick file. Table = off and a /32 AllowedIPs keep
 // the node's own traffic out of the tunnel, it only ever answers the relay.
 func Conf(set store.Settings, c store.Client) (string, error) {
 	relayPub, err := wg.PublicKey(set.PrivateKey)

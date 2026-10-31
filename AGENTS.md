@@ -1,6 +1,6 @@
 # AGENTS.md
 
-omenight: AmneziaWG exit nodes behind one relay. One Go binary,
+omenight: WireGuard exit nodes behind one relay, AmneziaWG optional. One Go binary,
 `omenight-relay`, plus `install.sh`, which runs on the nodes. Module name
 `omenight` (no domain in the module path).
 
@@ -20,12 +20,12 @@ Always build with `CGO_ENABLED=0`, the relay binary must be static.
 ## How it fits together
 
 - `init` fixes the settings (endpoint, net, port/mark base, iface prefix,
-  relay key, AWG params). Node N gets interface `om<N>`, UDP `51820+N`, the
+  relay key, optional AWG params). Node N gets interface `om<N>`, UDP `51820+N`, the
   N-th /30 of the net (relay `.1`, node `.2`) and fwmark = routing table
   `7700+N`. Everything derives from the slot, so settings never change after
   `init`. `Store.Init` refuses a second run.
 - `add` generates the node's key pair on the relay and prints a paste block,
-  `sh <<'OMENIGHT'`, the node's awg-quick conf in `OMENIGHT_CONF`, then
+  `sh <<'OMENIGHT'`, the node's wg-quick conf in `OMENIGHT_CONF`, then
   `install.sh` from `go:embed` with comments and blank lines stripped. The
   installer version is pinned to the relay binary, nothing is downloaded.
 - The daemon (`serve`) only reconciles. `wg.Manager.Sync` shells out to `ip`,
@@ -69,13 +69,18 @@ Always build with `CGO_ENABLED=0`, the relay binary must be static.
   blocks private ranges from the tunnel. On OpenWrt that is a fw4 zone with
   forwarding only to `wan` (the `wan` zone's masq does the NAT). pbr with
   `lan_device br-lan` does not touch tunnel traffic.
-- AWG params are the 1.0 set (jc, jmin, jmax, s1, s2, h1-h4). Every AWG
-  version understands it, newer ones add s3/s4/i1-i5 on top.
-- The private key goes to `awg set` through stdin (`private-key /dev/stdin`)
+- Plain WireGuard is the default because AWG has no packaged kernel module on
+  Debian. Its DKMS build needs the full kernel source and can break on kernel
+  upgrades, and userspace amneziawg-go would mean a process per node. AWG
+  params, if used, are the 1.0 set (jc, jmin, jmax, s1, s2, h1-h4).
+- The private key goes to `wg set` (or `awg set`) through stdin (`private-key /dev/stdin`)
   so it never shows in `ps`. `TestSync` enforces that.
 
 ## Traps
 
+- `install-relay.sh` holds the only copy of the systemd unit. It downloads
+  `omenight-relay-linux-<arch>` and `SHA256SUMS` from the release, so those
+  asset names are a contract with `release.yml`.
 - `install.sh` runs under busybox ash. No bashisms, no `grep -A`, no
   `base64`. Test changes there (`ssh <router> sh < script`) with `uci`,
   `ifup` and the firewall reload stubbed out.

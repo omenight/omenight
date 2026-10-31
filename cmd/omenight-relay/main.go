@@ -49,15 +49,17 @@ func main() {
 		setStatus(args, (*admin.Admin).Revoke, "revoked, its traffic is dropped")
 	case "remove":
 		remove(args)
+	case "down":
+		down(args)
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `omenight-relay - AmneziaWG exit nodes behind one relay
+	fmt.Fprintf(os.Stderr, `omenight-relay - WireGuard exit nodes behind one relay
 
-  init     -endpoint HOST [-kind awg|wg] [-net %s] [-port-base %d] [-mark-base %d]
+  init     -endpoint HOST [-kind wg|awg] [-net %s] [-port-base %d] [-mark-base %d]
   serve    [-socket %s]
   add      -name NAME            print the block to paste on the node
   show     -name NAME [-conf | -xray]
@@ -65,6 +67,7 @@ func usage() {
   revoke   -name NAME            drop its peer, keep its slot
   remove   -name NAME            free its slot, print the uninstall block
   clients
+  down                           delete every interface and rule the relay made
   tui      [-socket %s]
 
 Every command takes -state (default %s).
@@ -103,7 +106,7 @@ func client(st *store.Store, name string) store.Client {
 func initRelay(args []string) {
 	fs, state := flags("init")
 	endpoint := fs.String("endpoint", "", "hostname or IP nodes dial, e.g. home.omenight.com")
-	kind := fs.String("kind", wg.KindAWG, "awg (AmneziaWG) or wg (plain WireGuard)")
+	kind := fs.String("kind", wg.KindWG, "wg (in-kernel WireGuard) or awg (AmneziaWG, needs its module)")
 	nw := fs.String("net", admin.DefaultNet, "tunnel addresses, one /30 per node")
 	portBase := fs.Int("port-base", admin.DefaultPortBase, "node N listens on UDP port-base+N")
 	markBase := fs.Int("mark-base", admin.DefaultMarkBase, "node N gets fwmark and table mark-base+N")
@@ -190,7 +193,7 @@ func add(args []string) {
 func show(args []string) {
 	fs, state := flags("show")
 	name := fs.String("name", "", "node name")
-	conf := fs.Bool("conf", false, "print the awg-quick config instead")
+	conf := fs.Bool("conf", false, "print the wg-quick config instead")
 	xray := fs.Bool("xray", false, "print the Xray outbound instead")
 	fs.Parse(args)
 
@@ -243,4 +246,18 @@ func remove(args []string) {
 	}
 	fmt.Fprintf(os.Stderr, "%s removed, its interface goes away within 2s\n\nto clean up the node, paste this into a root shell there:\n\n", c.Name)
 	fmt.Print(admin.UninstallPaste())
+}
+
+// down is for uninstalling. A running daemon would recreate everything, so
+// stop it first.
+func down(args []string) {
+	fs, state := flags("down")
+	fs.Parse(args)
+
+	_, set := open(*state)
+	_, err := os.Stat("/proc/net/if_inet6")
+	if err := admin.Manager(set, wg.Exec{}, err == nil).Sync(nil); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("removed all omenight interfaces and rules")
 }
